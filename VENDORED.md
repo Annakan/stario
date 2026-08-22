@@ -7,7 +7,7 @@ with rationale and reversal hazard. **A refresh of the fork MUST re-apply or
 reconsider every item below; silently importing upstream loses Python 3.13
 compatibility.**
 
-Target runtime: Python **3.13.x** (project pin `requires-python = <3.14`;
+Target runtime: Python **3.13.x** (project pin `requires-python = >=3.13,<3.14`;
 PaddlePaddle has no 3.14 wheel). Upstream stario 4.1.0 declares
 `requires-python >= 3.13` but its **code and tests** were written against
 3.14-only features. Every divergence below is a 3.13-compat fix that upstream
