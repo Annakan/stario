@@ -5,6 +5,7 @@ Caught at the CLI entry boundary (`main`). Use
 Framework/runtime bugs should use `StarioError` and
 are translated to `CliError` at the CLI boundary where appropriate.
 """
+from __future__ import annotations
 
 from typing import NoReturn
 

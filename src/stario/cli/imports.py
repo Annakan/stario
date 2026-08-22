@@ -1,4 +1,5 @@
 """Import `module:callable` specs for CLI bootstrap, tracers, and similar entry points."""
+from __future__ import annotations
 
 import importlib
 import re

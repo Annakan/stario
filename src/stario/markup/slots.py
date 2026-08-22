@@ -14,6 +14,7 @@ always true at bake time.
 
 Cross-file coupling: tag.py, baked.py, and render.py import via identity checks.
 """
+from __future__ import annotations
 
 from dataclasses import dataclass
 

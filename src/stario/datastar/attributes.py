@@ -21,6 +21,7 @@ h.Div(star.text("$title"))
 
 Reference: https://data-star.dev/reference/attributes
 """
+from __future__ import annotations
 
 import json
 from collections.abc import Mapping

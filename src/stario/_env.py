@@ -1,4 +1,5 @@
 """Internal environment parsing helpers for env-backed framework configuration."""
+from __future__ import annotations
 
 import os
 from pathlib import Path

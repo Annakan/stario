@@ -1,4 +1,5 @@
 """Test-side telemetry tracer for `TestClient`."""
+from __future__ import annotations
 
 import bisect
 from types import TracebackType

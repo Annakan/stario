@@ -1,4 +1,5 @@
 """Internal terminal compatibility and ANSI styling for CLI and telemetry output."""
+from __future__ import annotations
 
 import os
 import sys
@@ -45,7 +46,7 @@ def enable_windows_console_vt() -> None:
             enable_vt = 0x0004  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
             if kernel32.SetConsoleMode(handle, mode.value | enable_vt):
                 _WIN32_VT_ENABLED = True
-    except OSError, AttributeError:
+    except (OSError, AttributeError):
         pass
 
 

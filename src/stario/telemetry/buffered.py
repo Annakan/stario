@@ -1,4 +1,5 @@
 """Shared bounded queue, writer thread, and self-metrics for Json/SQLite sinks."""
+from __future__ import annotations
 
 import queue
 import sys

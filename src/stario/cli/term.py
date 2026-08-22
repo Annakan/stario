@@ -3,6 +3,7 @@
 Used by the CLI for styled output. On Windows, styling enables VT processing once
 so escape codes render in older ConHost sessions (Windows Terminal already handles them).
 """
+from __future__ import annotations
 
 __all__ = ["echo", "err", "report_interrupt", "style"]
 

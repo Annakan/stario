@@ -33,6 +33,7 @@ default handler calls `responses.redirect`, not at construction.
 On `StarioError`, `message` is the short summary; `str(exc)` adds context, help, and
 example lines for logs and telemetry.
 """
+from __future__ import annotations
 
 from typing import Any
 

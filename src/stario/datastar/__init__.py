@@ -18,6 +18,7 @@ from stario.datastar import (
 instances. Import the classes when you need a separate namespace (tests or
 multiple configured builders).
 """
+from __future__ import annotations
 
 from .actions import DatastarActions, at
 from .attributes import DatastarAttributes, data

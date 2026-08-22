@@ -4,6 +4,7 @@ Immutable request view; mutable I/O state is isolated in `BodyReader` so handler
 Query, cookies, and host are parsed lazily. The reader applies size caps, timeouts, and backpressure so default
 request handling stays safe without each route re-implementing upload limits.
 """
+from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator, Callable, Mapping

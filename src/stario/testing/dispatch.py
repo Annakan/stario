@@ -1,4 +1,5 @@
 """Wire synthetic HTTP requests into an in-process `App` dispatch."""
+from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable

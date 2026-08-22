@@ -1,4 +1,5 @@
 """Bytes-on-wire transforms and bounded LRU caches for hot parse paths."""
+from __future__ import annotations
 
 from functools import lru_cache
 

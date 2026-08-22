@@ -4,6 +4,7 @@ Tracebacks hide Stario framework frames so application errors stay readable.
 Span attributes are encoded with `dumps_json` (`default=str` for unknown
 types); event bodies are stricter — see `serialize_event_body`.
 """
+from __future__ import annotations
 
 import json
 from functools import lru_cache

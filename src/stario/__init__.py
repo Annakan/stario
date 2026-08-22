@@ -25,6 +25,7 @@ with `app.use(pattern, mw)` on a `UrlPath` prefix.
 Import `Router` from `stario.http` when you need a separate route table. For HTTP types
 (`Request`, `ParsedQuery`, `Headers`, `RouteMatch`), use `stario.http`.
 """
+from __future__ import annotations
 
 from importlib.metadata import version as _package_version
 

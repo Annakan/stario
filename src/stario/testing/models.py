@@ -1,4 +1,5 @@
 """Request/response and telemetry snapshot types for the test client."""
+from __future__ import annotations
 
 import json as json_module
 from dataclasses import dataclass, field

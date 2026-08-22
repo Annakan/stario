@@ -1,4 +1,5 @@
 """Cookie wire helpers for TestClient (request `Cookie` and response `Set-Cookie`)."""
+from __future__ import annotations
 
 import http.cookies
 from collections.abc import Iterable, Mapping

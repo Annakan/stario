@@ -6,6 +6,7 @@ Bootstrap must be an async generator with a single `yield`. In tests use
 Server runtime policy is read from `STARIO_*` environment variables
 (see `stario.cli.env`).
 """
+from __future__ import annotations
 
 import inspect
 import math

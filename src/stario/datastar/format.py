@@ -2,6 +2,7 @@
 
 Used by attribute and action builders; you rarely import this module directly.
 """
+from __future__ import annotations
 
 import math
 import re

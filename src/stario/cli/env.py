@@ -4,6 +4,7 @@ Use this module in the CLI (`stario serve`, `stario watch`). Library code that
 constructs `Server` directly should call `stario.http.config.server_config_from_env`
 instead — it raises `StarioError`, not `CliError`.
 """
+from __future__ import annotations
 
 import sys
 from collections.abc import Callable

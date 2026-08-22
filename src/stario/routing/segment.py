@@ -10,6 +10,7 @@ Each URL piece becomes a `Segment` with one of three kinds:
 (matching). Use `Segment.parse` for pattern text; host/path parsers below apply
 placement rules.
 """
+from __future__ import annotations
 
 import keyword
 from dataclasses import dataclass

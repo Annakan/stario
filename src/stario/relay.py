@@ -19,6 +19,7 @@ Cross-loop delivery always uses `loop.call_soon_threadsafe`.
 `RelaySubscription` is an opaque handle — enter with `async with`, then
 consume with `receive()` or `async for`.
 """
+from __future__ import annotations
 
 from asyncio import AbstractEventLoop, Future, get_running_loop
 from collections import deque

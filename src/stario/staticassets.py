@@ -11,6 +11,7 @@ intentionally uses file symlinks (still contained under the root).
 files into memory, pre-compressing them, streaming large files from disk. Build it during bootstrap
 and call `register(app)`.
 """
+from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass

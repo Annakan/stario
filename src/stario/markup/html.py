@@ -12,6 +12,7 @@ Then e.g. `h.Div(...)`. Attribute and child rules match SVG tags (same
 For full pages use `h.HtmlDocument` (`<!doctype html>` + `<html>`). Use
 `h.Html` for fragments, tests, and benchmarks (`<html>` only).
 """
+from __future__ import annotations
 
 from .tag import Tag as _Tag
 

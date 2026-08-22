@@ -4,6 +4,7 @@ Public surface is mainly `TestClient`, `TestResponse`, `TestStreamResponse`,
 `TestTracer`, and `aload_app` (bootstrap loading for integration tests).
 Tests need an async runner (for example pytest-asyncio).
 """
+from __future__ import annotations
 
 from stario.testing.client import TestClient
 from stario.testing.load import aload_app

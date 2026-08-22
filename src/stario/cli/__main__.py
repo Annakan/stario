@@ -2,6 +2,7 @@
 
 Prefer the installed `stario` command when available.
 """
+from __future__ import annotations
 
 from stario.cli.main import main
 

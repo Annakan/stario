@@ -1,4 +1,5 @@
 """Buffered and streaming HTTP test responses."""
+from __future__ import annotations
 
 import asyncio
 import json as json_module

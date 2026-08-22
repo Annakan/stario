@@ -3,6 +3,7 @@
 Body and header size defaults for `RequestPolicy` are defined in `request.py`
 alongside `BodyReader`; this module re-exports them for env wiring.
 """
+from __future__ import annotations
 
 from collections.abc import Callable
 from typing import Literal

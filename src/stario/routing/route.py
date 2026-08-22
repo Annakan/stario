@@ -4,6 +4,7 @@
 leaf you register and call from Datastar: method plus that location. It does not
 compose with `/` and does not hold a handler.
 """
+from __future__ import annotations
 
 from collections.abc import Mapping
 

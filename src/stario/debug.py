@@ -1,4 +1,5 @@
 """Debug UI helpers for local development."""
+from __future__ import annotations
 
 from stario.datastar import data
 from stario.markup import HtmlElement, SafeString, baked

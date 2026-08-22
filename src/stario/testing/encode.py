@@ -1,9 +1,15 @@
 """Request body encoding and response parsing for TestClient."""
+from __future__ import annotations
 
 import json as json_module
 import zlib
 from collections.abc import Mapping, Sequence
-from compression import zstd
+
+try:  # Python >= 3.14 stdlib (PEP 784); vendored fork must also run on 3.13.
+    from compression import zstd
+except ImportError:
+    from backports import zstd  # backports.zstd on < 3.14
+
 from datetime import UTC, datetime
 from email.utils import format_datetime
 from typing import Any

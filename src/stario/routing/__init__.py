@@ -13,6 +13,7 @@ Read bottom-up when exploring internals: `locations` → `segment` → `urlpath`
 No HTTP wire imports — safe for routes modules, templates, and asset manifests.
 For request matching and handler dispatch, use `stario.http.dispatch.Router`.
 """
+from __future__ import annotations
 
 from stario.routing.locations import append_query_fragment, normalize_path
 from stario.routing.route import Route

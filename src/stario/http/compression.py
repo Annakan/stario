@@ -1,8 +1,13 @@
 """HTTP content-coding negotiation and compressor implementations."""
+from __future__ import annotations
 
 import zlib
 from collections.abc import Iterable
-from compression import zstd
+
+try:  # Python >= 3.14 stdlib (PEP 784); vendored fork must also run on 3.13.
+    from compression import zstd
+except ImportError:
+    from backports import zstd  # backports.zstd on < 3.14
 from typing import Any, ClassVar, cast
 
 import brotli  # pyright: ignore[reportMissingTypeStubs]

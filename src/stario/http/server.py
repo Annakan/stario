@@ -4,6 +4,7 @@ Runs `App` behind an asyncio listener: signal handling, bootstrap, graceful drai
 Bootstrap startup completes before `start_serving`; exceptions there fail startup loudly. Transport policy
 (TCP vs Unix, backlog, compression defaults) lives here so `Router`/`App` stay free of process-level concerns.
 """
+from __future__ import annotations
 
 import asyncio
 import importlib
@@ -351,7 +352,7 @@ class Server:
                     loop.call_soon_threadsafe(on_signal)
 
                 signal.signal(sig, _on_signal)
-            except RuntimeError, ValueError:
+            except (RuntimeError, ValueError):
                 continue
 
         try:
@@ -363,7 +364,7 @@ class Server:
                         signal.signal(sig, signal.SIG_IGN)
                     else:
                         signal.signal(sig, previous)
-                except RuntimeError, ValueError:
+                except (RuntimeError, ValueError):
                     continue
 
     @contextmanager

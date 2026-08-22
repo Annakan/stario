@@ -11,6 +11,7 @@ Patterns come from `stario.routing.UrlPath`. Register a `Route` with `add()`.
 attach handlers on the trie branch walked for `pattern`. During a request, the deepest
 node along the host/path walk with a policy handler wins (prefix-scoped inheritance).
 """
+from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field

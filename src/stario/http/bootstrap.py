@@ -5,6 +5,7 @@ Bootstrap must be an async generator that yields exactly once: code before `yiel
 is startup, code after is shutdown. The framework advances it with `anext()` so
 server failures never enter the generator.
 """
+from __future__ import annotations
 
 import inspect
 from collections.abc import AsyncGenerator, Callable

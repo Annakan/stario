@@ -3,6 +3,7 @@
 Read inbound cookies via `req.cookies` (backed by `parse_cookie_headers`).
 Write outbound cookies with `set_cookie` / `delete_cookie` on a `Writer`.
 """
+from __future__ import annotations
 
 import http.cookies
 from collections.abc import Iterable, Iterator

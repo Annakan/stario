@@ -36,6 +36,7 @@ Lighter import paths when you do not need the full package:
 - `import stario.markup.html as h` — tag catalog only (skips `baked`)
 - `from stario.markup.render import render` — serialization only
 """
+from __future__ import annotations
 
 from . import html, svg
 from .attributes import aria, classes, data, styles

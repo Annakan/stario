@@ -1,4 +1,5 @@
 """Small HTML tag helpers for loading Datastar."""
+from __future__ import annotations
 
 from stario.markup import HtmlElement
 from stario.markup import html as h

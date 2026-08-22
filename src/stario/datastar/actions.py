@@ -13,6 +13,7 @@ h.Button(data.on("click", at.fetch(REFRESH)), "Refresh")
 The methods return strings such as `@get('/items')` for use inside Datastar
 attributes like `data.on(...)`. Prefer `at.fetch(route)` when the URL is a `Route`.
 """
+from __future__ import annotations
 
 from collections.abc import Mapping
 from typing import Any, Literal

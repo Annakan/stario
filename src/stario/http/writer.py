@@ -4,6 +4,7 @@ One response object for complete bodies and for chunked streams (including SSE):
 Whether the client sees `Content-Length` or chunk encoding follows `headers` before the first write. Datastar helpers
 emit bytes that go through `write` like any other chunk—no parallel streaming API to learn.
 """
+from __future__ import annotations
 
 import asyncio
 import http

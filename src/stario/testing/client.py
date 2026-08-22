@@ -1,4 +1,5 @@
 """In-process async HTTP test client."""
+from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncGenerator, Callable

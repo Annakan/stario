@@ -1,4 +1,5 @@
 """Safe redirect target validation and encoding."""
+from __future__ import annotations
 
 from urllib.parse import quote, urlsplit
 

@@ -1,4 +1,5 @@
 """Tag objects that build HTML trees."""
+from __future__ import annotations
 
 import re
 from collections.abc import Mapping

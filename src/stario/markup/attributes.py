@@ -3,6 +3,7 @@
 The hot path is deliberately small: `Tag` renders plain mappings as
 `key=value` pairs and accepts pre-rendered `Attrs` fragments.
 """
+from __future__ import annotations
 
 from collections.abc import Mapping
 from typing import Any, cast

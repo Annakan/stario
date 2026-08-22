@@ -7,6 +7,7 @@ should write to the same output stream while the tracer is active.
 `TTYRenderer` is the pure span→string layer and the unit-test seam: no locks,
 threads, or I/O.
 """
+from __future__ import annotations
 
 import shutil
 import sys
@@ -140,7 +141,7 @@ def _span_status_style(span: RecordingSpan) -> str:
             continue
         try:
             code = int(span.attributes[key])
-        except ValueError, TypeError:
+        except (ValueError, TypeError):
             continue
         if 200 <= code < 300:
             return "green"

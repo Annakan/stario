@@ -1,4 +1,5 @@
 """Wire-format helpers for HTML attribute values (shared by Tag, attributes, baked)."""
+from __future__ import annotations
 
 from typing import cast
 

@@ -6,6 +6,7 @@ pass the same object to `app.get(...)` and `HOME.href(...)`.
 Construction flow: normalize path → parse host/path segments → collect
 placeholders → cache static hrefs when there is nothing to substitute.
 """
+from __future__ import annotations
 
 from collections.abc import Mapping
 from urllib.parse import quote

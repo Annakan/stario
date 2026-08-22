@@ -6,6 +6,7 @@ With `@baked`, capture runs once at decoration, flattening to a segment plan;
 each call splices parameters and returns a rendered `SafeString`.
 See the module docstring on `baked()` and tests in `test_markup.py`.
 """
+from __future__ import annotations
 
 import inspect
 from collections.abc import Callable

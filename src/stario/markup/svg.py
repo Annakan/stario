@@ -10,6 +10,7 @@ Then e.g. `svg.Circle(...)`. Attribute and child rules match HTML tags (same
 `stdDeviation`) and literal colon keys (`"xlink:href"`). For standalone SVG
 documents, set `xmlns` on the root `svg.Svg` element.
 """
+from __future__ import annotations
 
 from .tag import Tag as _Tag
 

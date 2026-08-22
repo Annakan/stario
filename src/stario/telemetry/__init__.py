@@ -13,6 +13,7 @@ from stario.telemetry.sqlite import SqliteTracer
 
 CLI reads `STARIO_TRACER` via `stario.cli.env.tracer_from_env()`.
 """
+from __future__ import annotations
 
 from .core import EventBody, Span, TelemetryStats, Tracer
 from .spans import NoOpSpan, ProxySpan, RecordedEvent, RecordedLink, RecordingSpan

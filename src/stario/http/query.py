@@ -1,4 +1,5 @@
 """Parsed query strings: repeated keys become lists; `ParsedQuery` exposes first-value and multi-value APIs."""
+from __future__ import annotations
 
 from typing import overload
 from urllib.parse import unquote_plus as _unquote_plus

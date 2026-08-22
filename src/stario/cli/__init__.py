@@ -8,3 +8,4 @@ implementation details — import them directly in tests, not from this package
 root. Prefer the installed `stario` command; use `python -m stario.cli` when
 no console script is on `PATH`.
 """
+from __future__ import annotations

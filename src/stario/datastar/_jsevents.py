@@ -1,4 +1,5 @@
 """DOM event names accepted by `DatastarAttributes.on()`. Runtime accepts any string."""
+from __future__ import annotations
 
 from typing import Literal
 

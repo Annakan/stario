@@ -4,6 +4,7 @@ Whole-response helpers built on top of `Writer`.
 Each helper writes headers and finalizes the response in one step, so handlers can
 stay focused on payload shape rather than framing details.
 """
+from __future__ import annotations
 
 from json import dumps as json_dumps
 

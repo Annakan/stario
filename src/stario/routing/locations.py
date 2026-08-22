@@ -3,6 +3,7 @@
 Bottom of the routing stack: no segment or UrlPath imports. Everything above
 builds on these string utilities.
 """
+from __future__ import annotations
 
 from collections.abc import Mapping
 from urllib.parse import quote, urlencode

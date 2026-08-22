@@ -12,6 +12,7 @@ safe bytes and want to skip repeated validation.
 `_encode_header_name` and `encode_header_value` are wire helpers used by
 `Headers` and tests; prefer the public `Headers` methods in application code.
 """
+from __future__ import annotations
 
 from functools import lru_cache
 from typing import cast

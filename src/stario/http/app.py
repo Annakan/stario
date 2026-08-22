@@ -4,6 +4,7 @@ Single entrypoint for request handling above the router: error surface, tracing,
 The protocol dispatches a callable; this class is where policy lives so the route trie stays a pure match/registration
 structure. `create_task` registers work the server can wait on during shutdown—use it instead of orphan `asyncio.create_task` calls for request-adjacent work.
 """
+from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable, Coroutine

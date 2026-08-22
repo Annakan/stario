@@ -20,6 +20,7 @@ Static file serving lives in `stario.staticassets`.
 
 For tests, `aload_app` is re-exported from `stario.testing`.
 """
+from __future__ import annotations
 
 from stario.http.app import App
 from stario.http.context import Context, Handler, Middleware, RouteMatch

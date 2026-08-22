@@ -1,4 +1,5 @@
 """Stario CLI entry point: argparse wiring and command dispatch."""
+from __future__ import annotations
 
 import argparse
 import sys

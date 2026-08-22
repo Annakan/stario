@@ -1,4 +1,5 @@
 """CLI help text: epilogs and `STARIO_*` environment variable reference."""
+from __future__ import annotations
 
 SERVER_ENV_EPILOG = """\
 Server environment variables (Stario does not load .env files; use your shell or tooling):

@@ -3,6 +3,7 @@
 Create one `SSE` per response: `sse = SSE(w)`. The stream opens when you call
 `sse.open()` or when the first event is written.
 """
+from __future__ import annotations
 
 import json
 from collections.abc import Mapping
