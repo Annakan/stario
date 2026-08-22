@@ -1,4 +1,5 @@
 """Tests for top-level CLI argument validation and dispatch."""
+from __future__ import annotations
 
 import pytest
 

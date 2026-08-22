@@ -1,4 +1,5 @@
 """Unit tests for compression negotiation helpers."""
+from __future__ import annotations
 
 from stario.http.compression import (
     CompressionConfig,

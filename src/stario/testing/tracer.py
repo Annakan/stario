@@ -4,7 +4,7 @@ from __future__ import annotations
 import bisect
 from types import TracebackType
 from typing import Any, Self, cast
-from uuid import UUID, uuid7
+from stario._uuid7 import UUID, uuid7
 
 from stario.telemetry.core import Attributes, Span, TelemetryStats
 from stario.telemetry.spans import RecordingSpan

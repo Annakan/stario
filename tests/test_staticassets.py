@@ -1,4 +1,5 @@
 """Tests for stario.staticassets - AssetManifest fingerprinting + StaticAssets serving."""
+from __future__ import annotations
 
 import tempfile
 from pathlib import Path

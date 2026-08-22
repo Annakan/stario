@@ -1,4 +1,5 @@
 """Tests for Datastar signal parsing via `stario.datastar.read_signals`."""
+from __future__ import annotations
 
 from urllib.parse import urlencode
 

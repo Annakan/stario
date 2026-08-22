@@ -1,4 +1,5 @@
 """Telemetry package imports (no optional Rich dependency; tracers are normal exports)."""
+from __future__ import annotations
 
 import subprocess
 import sys

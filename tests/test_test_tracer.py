@@ -1,4 +1,5 @@
 """`TestTracer` query helpers on `TestClient`."""
+from __future__ import annotations
 
 import asyncio
 

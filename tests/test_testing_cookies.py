@@ -1,4 +1,5 @@
 """Tests for TestClient cookie wire helpers (`stario.testing.cookies`)."""
+from __future__ import annotations
 
 import stario.cookies as cookies
 from stario.testing.cookies import (

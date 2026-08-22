@@ -19,7 +19,7 @@ from itertools import chain
 from types import TracebackType
 from typing import Any, TextIO, cast
 from unicodedata import combining, east_asian_width
-from uuid import UUID, uuid7
+from stario._uuid7 import UUID, uuid7
 
 from stario._terminal import RESET as _RESET
 from stario._terminal import SGR, color_enabled, enable_vt_for_stream

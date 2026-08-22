@@ -1,4 +1,5 @@
 """Tests for URL path normalization and query/fragment helpers."""
+from __future__ import annotations
 
 from stario.routing.locations import append_query_fragment, normalize_path
 

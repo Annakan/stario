@@ -6,7 +6,7 @@ import sys
 import threading
 import time
 from typing import Any, Self, cast
-from uuid import uuid7
+from stario._uuid7 import uuid7
 
 from .core import Attributes, Span, TelemetryStats, Tracer
 from .spans import RecordingSpan

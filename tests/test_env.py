@@ -1,4 +1,5 @@
 """Unit tests for stario._env helpers."""
+from __future__ import annotations
 
 import pytest
 

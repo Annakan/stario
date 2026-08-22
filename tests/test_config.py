@@ -1,4 +1,5 @@
 """Tests for HTTP server configuration validation."""
+from __future__ import annotations
 
 import pytest
 

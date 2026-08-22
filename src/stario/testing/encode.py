@@ -14,7 +14,7 @@ from datetime import UTC, datetime
 from email.utils import format_datetime
 from typing import Any
 from urllib.parse import urlencode
-from uuid import uuid7
+from stario._uuid7 import uuid7
 
 from stario.http.compression import brotli_decompress
 from stario.http.headers import Headers

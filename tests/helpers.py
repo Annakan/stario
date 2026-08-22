@@ -3,6 +3,7 @@
 Plain importable helpers (not fixtures) so test modules can compose them
 freely: `from tests.helpers import DummyWriter, make_context, ...`.
 """
+from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable, Coroutine, Generator

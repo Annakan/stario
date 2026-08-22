@@ -1,4 +1,5 @@
 """Tests for shared telemetry formatting helpers."""
+from __future__ import annotations
 
 from decimal import Decimal
 from uuid import UUID

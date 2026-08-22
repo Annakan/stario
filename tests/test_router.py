@@ -1,4 +1,5 @@
 """Tests for the trie-based HTTP router."""
+from __future__ import annotations
 
 import pytest
 

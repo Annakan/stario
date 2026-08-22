@@ -1,4 +1,5 @@
 """Tests for wire-level path/method decoding."""
+from __future__ import annotations
 
 import pytest
 

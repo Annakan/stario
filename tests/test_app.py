@@ -1,4 +1,5 @@
 """Tests for app-level routing and host dispatch."""
+from __future__ import annotations
 
 import pytest
 

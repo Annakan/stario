@@ -1,4 +1,5 @@
 """Tests for stario.relay - In-process pub/sub."""
+from __future__ import annotations
 
 import asyncio
 import queue

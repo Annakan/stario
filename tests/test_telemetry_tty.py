@@ -4,10 +4,12 @@ Formatting is verified through `TTYRenderer` on hand-built `RecordingSpan` recor
 Tracer lifecycle is verified through the public context-manager API with an injected `out`
 stream.
 """
+from __future__ import annotations
 
 import io
 import os
-from uuid import UUID, uuid4, uuid7
+from uuid import UUID, uuid4
+from stario._uuid7 import uuid7
 
 from stario.telemetry.noop import NoOpTracer
 from stario.telemetry.spans import RecordedEvent, RecordedLink, RecordingSpan

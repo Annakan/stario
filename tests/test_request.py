@@ -1,4 +1,5 @@
 """Tests for stario.http.request - HTTP request handling."""
+from __future__ import annotations
 
 import pytest
 

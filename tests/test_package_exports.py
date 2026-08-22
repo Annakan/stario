@@ -1,4 +1,5 @@
 """Smoke tests for public import surface."""
+from __future__ import annotations
 
 import importlib
 

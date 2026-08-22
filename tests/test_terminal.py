@@ -1,4 +1,5 @@
 """Tests for stario._terminal."""
+from __future__ import annotations
 
 import sys
 

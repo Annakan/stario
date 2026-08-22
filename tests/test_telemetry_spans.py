@@ -1,4 +1,5 @@
 """Tests for span primitives: `RecordingSpan`, `ProxySpan`, `NoOpSpan`."""
+from __future__ import annotations
 
 import json
 from collections.abc import Generator

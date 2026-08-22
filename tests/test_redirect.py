@@ -1,4 +1,5 @@
 """Shared redirect encoding used by responses and Datastar SSE."""
+from __future__ import annotations
 
 import pytest
 

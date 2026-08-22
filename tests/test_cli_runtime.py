@@ -1,4 +1,5 @@
 """Tests for watch CLI flags and validation."""
+from __future__ import annotations
 
 import shlex
 import subprocess

@@ -1,4 +1,5 @@
 """Streaming, client teardown, and telemetry (`TestClient` drains work on exit)."""
+from __future__ import annotations
 
 import asyncio
 

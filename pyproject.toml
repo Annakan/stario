@@ -27,6 +27,7 @@ dependencies = [
     "xxhash>=3.5.0,<4",
     "watchfiles>=1.1.0,<2",
     "backports.zstd; python_version < '3.14'",
+    "uuid-utils; python_version < '3.14'",
 ]
 
 [project.urls]

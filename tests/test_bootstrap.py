@@ -1,4 +1,5 @@
 """Tests for `stario.http.bootstrap` startup/shutdown driving."""
+from __future__ import annotations
 
 import pytest
 

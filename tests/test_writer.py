@@ -1,4 +1,5 @@
 """Tests for the public test client and low-level writer fallbacks."""
+from __future__ import annotations
 
 import asyncio
 import json

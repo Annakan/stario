@@ -89,6 +89,12 @@ class BakeSlot:
 
     def __ne__(self, other: object) -> bool:
         raise self._guard("inequality (!=)")
+    def __hash__(self) -> int:
+        # `__eq__` above sets the default `__hash__` to None; a dict/set
+        # lookup against a parameter would then leak the raw
+        # "unhashable type" TypeError instead of the loud bake-time guard.
+        raise self._guard("hashing — cannot use a parameter as a dict key or set member")
+        
 
     def __iter__(self):
         raise self._guard("iteration or unpacking")

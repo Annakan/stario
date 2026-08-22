@@ -4,6 +4,7 @@ These tests do **not** replace dedicated fuzzers (AFL++/libFuzzer) or external a
 regress common parser failure modes and ensure arbitrary bytes do not escape as unhandled
 exceptions from the protocol layer. See `SECURITY.md` for scope and limitations.
 """
+from __future__ import annotations
 
 import asyncio
 import random

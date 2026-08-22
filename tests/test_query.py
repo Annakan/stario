@@ -1,4 +1,5 @@
 """Unit tests for query string parsing."""
+from __future__ import annotations
 
 from stario.http.query import ParsedQuery
 
