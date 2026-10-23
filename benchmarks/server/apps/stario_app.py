@@ -2,8 +2,7 @@
 
 import ujson
 
-import stario.responses as responses
-from stario import App, Span
+from stario import App, Route, Span
 
 HELLO = "Hello, World!"
 JSON_CONTENT_TYPE = b"application/json"
@@ -14,7 +13,7 @@ def json_response(w, value, status: int = 200) -> None:
 
 
 async def plaintext(c, w):
-    responses.text(w, HELLO)
+    w.text(HELLO)
 
 
 async def json_endpoint(c, w):
@@ -22,7 +21,7 @@ async def json_endpoint(c, w):
 
 
 async def get_user(c, w):
-    user_id = c.route.params["user_id"]
+    user_id = c.match.params["user_id"]
     json_response(w, {"id": user_id, "name": f"User {user_id}"})
 
 
@@ -42,8 +41,8 @@ async def validate(c, w):
 
 
 async def bootstrap(app: App, span: Span) -> None:
-    app.get("/plaintext", plaintext)
-    app.get("/json", json_endpoint)
-    app.get("/user/{user_id}", get_user)
-    app.post("/validate", validate)
+    app.add(Route("GET /plaintext"), plaintext)
+    app.add(Route("GET /json"), json_endpoint)
+    app.add(Route("GET /user/{user_id}"), get_user)
+    app.add(Route("POST /validate"), validate)
     yield

@@ -4,17 +4,18 @@ Create one `SSE` per response: `sse = SSE(w)`. The stream opens when you call
 `sse.open()` or when the first event is written.
 """
 
-import json
 from collections.abc import Mapping
 from typing import Any, Literal
 
 from stario.exceptions import StarioError, StarioRuntime
 from stario.http.redirect import normalized_location
 from stario.http.writer import Writer
+from stario.json import JsonValue
+from stario.json import dumps as json_dumps
+from stario.json import dumps_bytes as json_dumps_bytes
 from stario.markup.render import render
-from stario.responses import JsonValue
 
-from .format import require_mapping, validate_signal_name
+from .format import expand_signal_paths, require_mapping
 
 type JsonObject = Mapping[str, JsonValue]
 type PatchMode = Literal[
@@ -36,6 +37,8 @@ _PATCH_MODE_HELP = "Use one of: " + ", ".join(_PATCH_MODE_NAMES) + "."
 _NAMESPACES = ("svg", "mathml")
 _EVENT_PATCH_ELEMENTS = b"event: datastar-patch-elements"
 _EVENT_PATCH_SIGNALS = b"event: datastar-patch-signals"
+# Datastar SDK default; `retry=1000` means "do not emit the field".
+_SSE_RETRY_DEFAULT = 1000
 
 
 def _sse_field_value(name: str, value: str) -> bytes:
@@ -52,13 +55,42 @@ def _sse_field_value(name: str, value: str) -> bytes:
     return value.encode()
 
 
+def _sse_payload_lines(data: bytes) -> list[bytes]:
+    """Split an SSE payload on CR, LF, or CRLF (HTML event-stream line endings)."""
+    return data.replace(b"\r\n", b"\n").replace(b"\r", b"\n").split(b"\n")
+
+
+def _sse_event_meta(event_id: str | None, retry: int | None) -> list[bytes]:
+    """`id:`/`retry:` fields placed right after the `event:` line."""
+    lines: list[bytes] = []
+    if event_id is not None:
+        if "\x00" in event_id:
+            raise StarioError(
+                "Datastar SSE event_id must not contain NUL",
+                context={"event_id": event_id[:100]},
+            )
+        lines.append(b"id: " + _sse_field_value("event_id", event_id))
+    if retry is not None:
+        if type(retry) is not int or retry <= 0:
+            raise StarioError(
+                "Datastar SSE retry must be a positive int",
+                context={"retry": repr(retry)},
+                help_text="Milliseconds for the client to wait before reconnecting.",
+            )
+        if retry != _SSE_RETRY_DEFAULT:
+            lines.append(f"retry: {retry}".encode("ascii"))
+    return lines
+
+
 class SSE:
     """Datastar SSE response bound to one `Writer`.
 
     `open()` sends headers immediately. If you skip it, the first event opens the
     stream. Event bytes still go through `Writer.write()`, so normal streaming
-    compression policy applies. Top-level `patch_signals()` keys are snake_case;
-    use nested JSON objects for nested state rather than dotted signal paths.
+    compression policy applies. `patch_signals()` keys pass through to Datastar
+    unchanged; names starting with `_` are local signals the browser does not
+    send. A dot in a key is a nested path — `{"ui.open": True}` patches
+    `$ui.open`.
     """
 
     __slots__ = ("w",)
@@ -81,6 +113,8 @@ class SSE:
         namespace: Namespace | None = None,
         view_transition: bool = False,
         view_transition_selector: str | None = None,
+        event_id: str | None = None,
+        retry: int | None = None,
     ) -> None:
         """Patch DOM elements with bytes, text, or Stario markup."""
         if mode is not None and mode not in _PATCH_MODES:
@@ -96,7 +130,7 @@ class SSE:
                 help_text="Use 'svg', 'mathml', or omit namespace.",
             )
 
-        lines = [_EVENT_PATCH_ELEMENTS]
+        lines = [_EVENT_PATCH_ELEMENTS, *_sse_event_meta(event_id, retry)]
         if mode is not None:
             lines.append(f"data: mode {mode}".encode("ascii"))
         if selector:
@@ -119,7 +153,9 @@ class SSE:
             html_bytes = render(content).encode("utf-8")
 
         # SSE represents multiline payloads as repeated `data:` lines.
-        for line in html_bytes.split(b"\n"):
+        # Split on CR, LF, and CRLF: a bare CR is a line terminator in the
+        # event-stream parser and must not remain inside a `data:` field.
+        for line in _sse_payload_lines(html_bytes):
             lines.append(b"data: elements " + line)
 
         self._prepare_headers()
@@ -130,28 +166,47 @@ class SSE:
         payload: JsonObject,
         *,
         only_if_missing: bool = False,
+        event_id: str | None = None,
+        retry: int | None = None,
     ) -> None:
-        """Patch Datastar signals from a JSON-shaped mapping."""
-        data = dict(require_mapping("patch_signals", payload))
-        for key in data:
-            validate_signal_name(key)
-        json_bytes = json.dumps(data, separators=(",", ":"), ensure_ascii=False).encode(
-            "utf-8"
-        )
-        lines = [_EVENT_PATCH_SIGNALS]
+        """Patch Datastar signals from a JSON-shaped mapping.
+
+        Dotted keys expand to nested objects, so `{"ui.open": True}`
+        patches `$ui.open`.
+        """
+        data = expand_signal_paths(require_mapping("patch_signals", payload))
+        json_bytes = json_dumps_bytes(data)
+        lines = [_EVENT_PATCH_SIGNALS, *_sse_event_meta(event_id, retry)]
         if only_if_missing:
             lines.append(b"data: onlyIfMissing true")
-        for line in json_bytes.split(b"\n"):
+        for line in _sse_payload_lines(json_bytes):
             lines.append(b"data: signals " + line)
         self._prepare_headers()
         self.w.write(b"\n".join(lines) + b"\n\n")
 
-    def navigate(self, url: str) -> None:
+    def navigate(
+        self,
+        url: str,
+        *,
+        event_id: str | None = None,
+        retry: int | None = None,
+    ) -> None:
         """Navigate the browser from an SSE response; not an HTTP redirect."""
-        safe_url = json.dumps(normalized_location(url))
-        self.execute_script(f"setTimeout(() => window.location = {safe_url});")
+        safe_url = json_dumps(normalized_location(url))
+        self.execute_script(
+            f"setTimeout(() => window.location = {safe_url});",
+            event_id=event_id,
+            retry=retry,
+        )
 
-    def execute_script(self, code: str, *, auto_remove: bool = True) -> None:
+    def execute_script(
+        self,
+        code: str,
+        *,
+        auto_remove: bool = True,
+        event_id: str | None = None,
+        retry: int | None = None,
+    ) -> None:
         """Run trusted developer-authored JavaScript by appending a script element.
 
         The code is streamed verbatim; do not interpolate untrusted input.
@@ -161,17 +216,45 @@ class SSE:
             script = b'<script data-effect="el.remove();">' + code_bytes + b"</script>"
         else:
             script = b"<script>" + code_bytes + b"</script>"
-        self.patch_elements(script, mode="append", selector="body")
+        self.patch_elements(
+            script,
+            mode="append",
+            selector="body",
+            event_id=event_id,
+            retry=retry,
+        )
 
-    def remove(self, selector: str) -> None:
+    def remove(
+        self,
+        selector: str,
+        *,
+        event_id: str | None = None,
+        retry: int | None = None,
+    ) -> None:
         """Remove nodes matching `selector`."""
         lines = [
             _EVENT_PATCH_ELEMENTS,
+            *_sse_event_meta(event_id, retry),
             b"data: mode remove",
             b"data: selector " + _sse_field_value("selector", selector),
         ]
         self._prepare_headers()
         self.w.write(b"\n".join(lines) + b"\n\n")
+
+    def ping(self, comment: str = "") -> None:
+        """Write an SSE comment (`: ...`) to keep proxies and clients alive.
+
+        A heartbeat loop looks like:
+
+        ```python
+        async with c.alive():
+            while True:
+                sse.ping()
+                await asyncio.sleep(15)
+        ```
+        """
+        self._prepare_headers()
+        self.w.write(b": " + _sse_field_value("comment", comment) + b"\n\n")
 
     def _prepare_headers(self) -> None:
         w = self.w
@@ -180,7 +263,7 @@ class SSE:
                 "Cannot send SSE events after the response is completed",
                 help_text=(
                     "Create and use `SSE(w)` before response helpers like "
-                    "`responses.html()`, `responses.redirect()`, `responses.empty()`, or `w.end()`."
+                    "`w.html()`, `w.redirect()`, `w.empty()`, or `w.end()`."
                 ),
                 example=(
                     "from stario.datastar import SSE\n\n"

@@ -1,144 +1,67 @@
-"""
-Route table: register patterns on a trie, match requests against it.
+"""Route table: register `Route` values on a trie and resolve `(host, path, method)`."""
 
-Host routes are tried first when present; hostless routes are shared defaults (Go-style).
-Patterns come from `stario.routing.UrlPath`. Register a `Route` with `add()`.
+from __future__ import annotations
 
-**Match cache.** `find_handler` memoizes `(host, path, method)` → `(handler, route_match)`
-(LRU, 1024 entries). Registration clears the cache.
-
-**404 / 405 policy.** `not_found(pattern, ...)` and `method_not_allowed(pattern, ...)`
-attach handlers on the trie branch walked for `pattern`. During a request, the deepest
-node along the host/path walk with a policy handler wins (prefix-scoped inheritance).
-"""
-
+import inspect
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from functools import lru_cache
-from types import MappingProxyType
-from typing import Literal, cast
+from functools import lru_cache, partial
 
-import stario.responses as responses
 from stario.exceptions import StarioError
-from stario.http.context import (
-    EMPTY_ROUTE_MATCH,
-    Context,
-    Handler,
-    Middleware,
-    RouteMatch,
-)
+from stario.http.context import Context, Handler, Match, Middleware
+from stario.http.route import EMPTY_ROUTE, Route
+from stario.http.segment import Segment
 from stario.http.writer import Writer
-from stario.routing import Route, Segment, UrlPath
+from stario_cython.exchange import CRouter, compile_router
 
 type MethodNotAllowedHandler = Callable[[frozenset[str]], Handler]
-type MatchStatus = Literal["found", "method_not_allowed", "not_found"]
+type RouteMatch = tuple[Handler, Route, Match]
 
 
-def _as_pattern(path: UrlPath | str) -> UrlPath:
-    return path if isinstance(path, UrlPath) else UrlPath(path)
+def require_async_handler(handler: object, *, what: str = "Handler") -> None:
+    """Reject anything that is not an async callable (checked at registration)."""
+    if not callable(handler):
+        raise StarioError(
+            f"{what} must be callable",
+            context={"got": type(handler).__name__},
+            help_text="Register `async def handler(c, w):`.",
+        )
 
+    fn: object = handler
+    while isinstance(fn, partial):
+        fn = fn.func
 
-@dataclass(slots=True)
-class Endpoint:
-    handler: Handler
-    route_match: RouteMatch
+    if inspect.isasyncgenfunction(fn):
+        raise StarioError(
+            f"{what} cannot be an async generator",
+            help_text="Use `async def handler(c, w):` and write to the Writer, not `yield`.",
+        )
+    if inspect.iscoroutinefunction(fn):
+        return
 
+    call = fn.__call__ if callable(fn) else None
+    if call is not None and call is not fn:
+        if inspect.isasyncgenfunction(call):
+            raise StarioError(
+                f"{what} cannot be an async generator",
+                help_text="Use `async def __call__(self, c, w):` and write to the Writer, not `yield`.",
+            )
+        if inspect.iscoroutinefunction(call):
+            return
 
-@dataclass(slots=True)
-class Node:
-    not_found_handler: Handler | None = None
-    method_not_allowed_handler: MethodNotAllowedHandler | None = None
-    middleware: tuple[Middleware, ...] = ()
-    host_depth: int = 0
-    exact: dict[str, Node] = field(default_factory=lambda: {})
-    wildcard_name: str | None = None
-    wildcard: Node | None = None
-    catchall_name: str | None = None
-    catchall: Node | None = None
-    endpoints: dict[str, Endpoint] | None = None
-    methods: frozenset[str] = frozenset()
-
-
-def _pattern_child(current: Node, segment: Segment) -> Node | None:
-    if segment.kind == "catchall":
-        if current.catchall is None or current.catchall_name != segment.name:
-            return None
-        return current.catchall
-    if segment.kind == "wildcard":
-        if current.wildcard is None or current.wildcard_name != segment.name:
-            return None
-        return current.wildcard
-    return current.exact.get(segment.name)
-
-
-def trie_descend(
-    root: Node,
-    pattern: UrlPath,
-    *,
-    create: bool,
-    host_tree: bool,
-) -> Node:
-    """Walk a pattern branch on the trie; create child nodes when `create` is true."""
-    current = root
-    for segment in pattern.host_trie():
-        if create:
-            current = _descend_or_create(current, segment, host_label=host_tree)
-        else:
-            child = _pattern_child(current, segment)
-            if child is None:
-                return current
-            current = child
-    for segment in pattern.path:
-        if create:
-            current = _descend_or_create(current, segment, host_label=False)
-        else:
-            child = _pattern_child(current, segment)
-            if child is None:
-                return current
-            current = child
-    return current
-
-
-def _collect_middleware(
-    tree: Node,
-    pattern: UrlPath,
-    *,
-    path_only: bool = False,
-) -> list[Middleware]:
-    """Collect scope middleware along a registered pattern branch."""
-    middlewares: list[Middleware] = list(tree.middleware)
-    current = tree
-
-    if not path_only:
-        for segment in pattern.host_trie():
-            child = _pattern_child(current, segment)
-            if child is None:
-                return middlewares
-            current = child
-            middlewares.extend(current.middleware)
-
-    for segment in pattern.path:
-        child = _pattern_child(current, segment)
-        if child is None:
-            break
-        current = child
-        middlewares.extend(current.middleware)
-
-    return middlewares
-
-
-def _branch_has_endpoints(node: Node) -> bool:
-    if node.endpoints:
-        return True
-    return (
-        (node.wildcard is not None and _branch_has_endpoints(node.wildcard))
-        or (node.catchall is not None and _branch_has_endpoints(node.catchall))
-        or any(_branch_has_endpoints(child) for child in node.exact.values())
+    raise StarioError(
+        f"{what} must be async",
+        context={"got": type(handler).__name__},
+        help_text="Register `async def handler(c, w):`. Sync handlers are not supported.",
     )
 
 
+def _exact_nodes() -> dict[str, Node]:
+    return {}
+
+
 async def default_not_found(_c: Context, w: Writer) -> None:
-    responses.text(w, "Not Found", 404)
+    w.text("Not Found", 404)
 
 
 @lru_cache(maxsize=256)
@@ -147,375 +70,443 @@ def method_not_allowed_handler(allowed: frozenset[str]) -> Handler:
 
     async def respond(_c: Context, w: Writer) -> None:
         w.headers.set("Allow", allow_header)
-        responses.text(w, "Method Not Allowed", 405)
+        w.text("Method Not Allowed", 405)
 
     return respond
 
 
-def _walk_values(
-    current: Node,
-    segments: tuple[str, ...],
-    params: dict[str, str] | None,
-    not_found: Handler,
-    not_found_custom: bool,
-    method_na: MethodNotAllowedHandler | None,
-    *,
-    path: str | None = None,
-) -> (
-    tuple[Node, dict[str, str] | None, Handler, bool, MethodNotAllowedHandler | None]
-    | None
-):
-    """Walk request host or path segments on the trie."""
-    path_off = 0 if path is None or path == "/" else 1
-    i = 0
-    n = len(segments)
-    while i < n:
-        seg = segments[i]
-        child = current.exact.get(seg)
-        if child is not None:
-            i += 1
-            if path is not None:
-                path_off += len(seg) + 1
-        elif (wc := current.wildcard) is not None:
-            if params is None:
-                params = {}
-            params[cast(str, current.wildcard_name)] = seg
-            child = wc
-            i += 1
-            if path is not None:
-                path_off += len(seg) + 1
-        elif (ca := current.catchall) is not None:
-            if name := current.catchall_name:
-                if params is None:
-                    params = {}
-                if path is None:
-                    params[name] = ".".join(reversed(segments[i:]))
-                else:
-                    params[name] = path[path_off:]
-            child = ca
-            i = n
-        else:
+@dataclass(slots=True)
+class Endpoint:
+    handler: Handler
+    route: Route
+    middleware: tuple[Middleware, ...] = ()
+
+
+@dataclass(slots=True)
+class Node:
+    not_found_handler: Handler | None = None
+    not_found_custom: bool = False
+    method_not_allowed_handler: MethodNotAllowedHandler | None = None
+    middleware: tuple[Middleware, ...] = ()
+    exact: dict[str, Node] = field(default_factory=_exact_nodes)
+    wildcard_name: str | None = None
+    wildcard: Node | None = None
+    catchall_name: str | None = None
+    catchall: Node | None = None
+    endpoints: dict[str, Endpoint] | None = None
+
+
+def _param_child(current: Node, segment: Segment) -> Node | None:
+    if segment.kind == "catchall":
+        if current.catchall is None or current.catchall_name != segment.name:
             return None
-        if (nf := child.not_found_handler) is not None:
-            not_found = nf
-            not_found_custom = True
-        if (mna := child.method_not_allowed_handler) is not None:
-            method_na = mna
-        current = child
-    return current, params, not_found, not_found_custom, method_na
+        return current.catchall
+    if current.wildcard is None or current.wildcard_name != segment.name:
+        return None
+    return current.wildcard
 
 
-def _resolve(
-    root: Node,
-    host_segments: tuple[str, ...],
-    path: str,
-    path_segments: tuple[str, ...],
-    method: str,
-) -> tuple[Handler, RouteMatch, MatchStatus, bool]:
-    params: dict[str, str] | None = None
-    not_found = root.not_found_handler or default_not_found
-    not_found_custom = root.not_found_handler is not None
-    method_na = root.method_not_allowed_handler
-    current = root
+def _step(current: Node, segs: tuple[Segment, ...], i: int) -> tuple[Node, int] | None:
+    seg = segs[i]
+    if seg.kind == "exact":
+        child = current.exact.get(seg.name)
+    else:
+        child = _param_child(current, seg)
+    if child is None:
+        return None
+    return child, i + 1
 
-    walked = _walk_values(
-        current,
-        host_segments,
-        params,
-        not_found,
-        not_found_custom,
-        method_na,
+
+def _collect_middleware(
+    tree: Node,
+    host_segments: tuple[Segment, ...],
+    path_segments: tuple[Segment, ...],
+) -> list[Middleware]:
+    middlewares: list[Middleware] = list(tree.middleware)
+    current = tree
+
+    def follow(segs: tuple[Segment, ...], *, halt: bool) -> bool:
+        nonlocal current
+        i = 0
+        while i < len(segs):
+            stepped = _step(current, segs, i)
+            if stepped is None:
+                return halt
+            current, i = stepped
+            middlewares.extend(current.middleware)
+        return False
+
+    if follow(host_segments[::-1], halt=True):
+        return middlewares
+    follow(path_segments, halt=False)
+    return middlewares
+
+
+def _wrap(handler: Handler, middleware: Sequence[Middleware]) -> Handler:
+    wrapped = handler
+    for mw in reversed(middleware):
+        wrapped = mw(wrapped)
+    return wrapped
+
+
+def _path_step(node: Node, kind: str, name: str) -> Node | None:
+    if kind == "exact":
+        return node.exact.get(name)
+    if kind == "catchall":
+        if node.catchall_name != name:
+            return None
+        return node.catchall
+    if node.wildcard_name != name:
+        return None
+    return node.wildcard
+
+
+class _Composed:
+    """Router-shaped view with middleware already applied, for `compile_router`."""
+
+    __slots__ = (
+        "_has_param_hosts",
+        "_host_routing",
+        "_hosts_exact",
+        "_hosts_param",
+        "_path",
     )
-    if walked is None:
-        return not_found, EMPTY_ROUTE_MATCH, "not_found", not_found_custom
-    current, params, not_found, not_found_custom, method_na = walked
 
-    walked = _walk_values(
-        current,
-        path_segments,
-        params,
-        not_found,
-        not_found_custom,
-        method_na,
-        path=path,
-    )
-    if walked is None:
-        return not_found, EMPTY_ROUTE_MATCH, "not_found", not_found_custom
-    current, params, not_found, not_found_custom, method_na = walked
-
-    endpoint = None if current.endpoints is None else current.endpoints.get(method)
-
-    if endpoint is None:
-        if current.methods:
-            return (
-                (method_na or method_not_allowed_handler)(current.methods),
-                EMPTY_ROUTE_MATCH,
-                "method_not_allowed",
-                not_found_custom,
-            )
-        return not_found, EMPTY_ROUTE_MATCH, "not_found", not_found_custom
-
-    if params is None:
-        return endpoint.handler, endpoint.route_match, "found", not_found_custom
-    return (
-        endpoint.handler,
-        RouteMatch(
-            pattern=endpoint.route_match.pattern, params=MappingProxyType(params)
-        ),
-        "found",
-        not_found_custom,
-    )
+    def __init__(
+        self,
+        path: Node,
+        hosts_exact: dict[str, Node],
+        hosts_param: Node,
+        has_param_hosts: bool,
+        host_routing: bool,
+    ) -> None:
+        self._path = path
+        self._hosts_exact = hosts_exact
+        self._hosts_param = hosts_param
+        self._has_param_hosts = has_param_hosts
+        self._host_routing = host_routing
 
 
-def _descend_or_create(
-    current: Node, segment: Segment, *, host_label: bool = False
-) -> Node:
-    child = _pattern_child(current, segment)
+def _open_param(current: Node, segment: Segment) -> Node:
+    child = _param_child(current, segment)
     if child is not None:
         return child
-
-    child_host_depth = current.host_depth + (1 if host_label else 0)
-
-    if segment.kind == "catchall":
-        name = segment.name
-        if current.catchall is not None:
-            raise StarioError(
-                "Catchall parameter conflict",
-                context={
-                    "existing": current.catchall_name,
-                    "new": name,
-                    "segment": segment.pattern,
-                },
-                help_text="Use the same catchall parameter name for routes sharing this branch.",
-            )
-        if current.wildcard is not None:
-            raise StarioError(
-                "Ambiguous route parameter branch",
-                context={
-                    "existing": current.wildcard_name,
-                    "new": name,
-                    "segment": segment.pattern,
-                },
-                help_text=(
-                    "A wildcard and catchall cannot share the same branch because "
-                    "matching is deterministic and does not backtrack."
-                ),
-            )
-        child = Node(host_depth=child_host_depth)
-        current.catchall_name = name
+    catchall = segment.kind == "catchall"
+    taken = current.catchall_name if catchall else current.wildcard_name
+    other = current.wildcard if catchall else current.catchall
+    if taken is not None:
+        raise StarioError(
+            "Catchall parameter conflict"
+            if catchall
+            else "Wildcard parameter conflict",
+            context={
+                "existing": taken,
+                "new": segment.name,
+                "segment": segment.pattern,
+            },
+        )
+    if other is not None:
+        raise StarioError(
+            "Ambiguous route parameter branch",
+            context={
+                "existing": current.wildcard_name
+                if catchall
+                else current.catchall_name,
+                "new": segment.name,
+            },
+        )
+    child = Node()
+    if catchall:
+        current.catchall_name = segment.name
         current.catchall = child
-        return child
-
-    if segment.kind == "wildcard":
-        name = segment.name
-        if current.wildcard is not None:
-            raise StarioError(
-                "Wildcard parameter conflict",
-                context={
-                    "existing": current.wildcard_name,
-                    "new": name,
-                    "segment": segment.pattern,
-                },
-                help_text="Use the same wildcard parameter name for routes sharing this branch.",
-            )
-        if current.catchall is not None:
-            raise StarioError(
-                "Ambiguous route parameter branch",
-                context={
-                    "existing": current.catchall_name,
-                    "new": name,
-                    "segment": segment.pattern,
-                },
-                help_text=(
-                    "A wildcard and catchall cannot share the same branch because "
-                    "matching is deterministic and does not backtrack."
-                ),
-            )
-        child = Node(host_depth=child_host_depth)
-        current.wildcard_name = name
+    else:
+        current.wildcard_name = segment.name
         current.wildcard = child
-        return child
+    return child
 
-    child = Node(host_depth=child_host_depth)
-    current.exact[segment.name] = child
+
+def _descend_or_create(current: Node, segment: Segment) -> Node:
+    if segment.kind != "exact":
+        return _open_param(current, segment)
+    child = current.exact.get(segment.name)
+    if child is None:
+        child = Node()
+        current.exact[segment.name] = child
     return child
 
 
 class Router:
     """Route table: host routes override hostless defaults when they fully match."""
 
-    __slots__ = ("_find_handler", "_has_hosts", "_hosts", "_path")
+    __slots__ = (
+        "_cy_router",
+        "_frozen",
+        "_has_param_hosts",
+        "_host_routing",
+        "_hosts_exact",
+        "_hosts_param",
+        "_path",
+    )
 
     def __init__(self) -> None:
         self._path = Node()
-        self._hosts = Node()
-        self._has_hosts = False
-
-        @lru_cache(maxsize=1024)
-        def find_handler(
-            host: str,
-            path: str,
-            method: str,
-        ) -> tuple[Handler, RouteMatch]:
-            return self._match(
-                host,
-                path,
-                method,
-                UrlPath.request_path(path),
-                UrlPath.request_host(host),
-            )
-
-        self._find_handler = find_handler
+        self._hosts_exact: dict[str, Node] = {}
+        self._hosts_param = Node()
+        self._has_param_hosts = False
+        self._host_routing = False
+        self._frozen = False
+        # Compiled on the first lookup after a change. Registering N routes
+        # is then N tree inserts and one compile, not N compiles.
+        self._cy_router: CRouter | None = None
 
     @property
     def host_routing(self) -> bool:
-        return self._has_hosts
+        return self._host_routing
 
-    def find_handler(
-        self,
-        host: str,
-        path: str,
-        method: str,
-    ) -> tuple[Handler, RouteMatch]:
-        return self._find_handler(host, path, method)
+    def find_handler(self, host: str, path: str, method: str) -> RouteMatch:
+        """Resolve `(host, path, method)`.
 
-    def _clear_match_cache(self) -> None:
-        self._find_handler.cache_clear()
+        `host` must already be lowercased (`Request.host`). `path` is the
+        request path as sent (`Request.raw_path`, still percent-encoded): it is
+        split on `/` first and each segment is decoded on its own, so `%2F`
+        never adds a segment. Plain paths like `/users/42` are the same either
+        way.
+        """
+        return self.compiled().lookup(host, path, method)
 
-    def _match(
-        self,
-        host: str,
-        path: str,
-        method: str,
-        path_segments: tuple[str, ...],
-        host_labels: tuple[str, ...],
-    ) -> tuple[Handler, RouteMatch]:
-        if self._has_hosts and host:
-            host_handler, host_match, host_status, host_nf_custom = _resolve(
-                self._hosts, host_labels, path, path_segments, method
+    def compiled(self) -> CRouter:
+        """The compiled trie, built now if a registration changed it."""
+        compiled = self._cy_router
+        if compiled is None:
+            compiled = compile_router(self._composed())
+            self._cy_router = compiled
+            state = getattr(self, "_app_state", None)
+            if state is not None:
+                state.host_routing = self._host_routing
+                state.router = compiled
+        return compiled
+
+    def freeze(self) -> None:
+        """Seal the table: `add`/`use`/`not_found`/`method_not_allowed` raise.
+
+        Called once startup completes so a request-time registration bug fails
+        loudly instead of silently replacing the compiled trie under traffic.
+        """
+        self._frozen = True
+
+    def _check_frozen(self) -> None:
+        if self._frozen:
+            raise StarioError(
+                "Routes are frozen after startup",
+                help_text="Register routes in bootstrap before yield.",
             )
-            if host_status == "found":
-                return host_handler, host_match
-            path_handler, path_match, path_status, _path_nf_custom = _resolve(
-                self._path, (), path, path_segments, method
-            )
-            if path_status == "found":
-                return path_handler, path_match
-            if host_status == "method_not_allowed":
-                return host_handler, host_match
-            if path_status == "method_not_allowed":
-                return path_handler, path_match
-            if host_nf_custom:
-                return host_handler, host_match
-            return path_handler, path_match
 
-        path_handler, path_match, path_status, _path_nf_custom = _resolve(
-            self._path, (), path, path_segments, method
+    def _invalidate_lookup(self) -> None:
+        self._cy_router = None
+        state = getattr(self, "_app_state", None)
+        if state is not None:
+            state.host_routing = self._host_routing
+            state.router = None
+
+    def _composed(self) -> _Composed:
+        """Copy of the three trees with middleware folded into every handler."""
+        return _Composed(
+            self._compose_node(self._path, self._path, param_host=False),
+            {
+                host: self._compose_node(
+                    tree,
+                    tree,
+                    param_host=False,
+                    path_node=self._path,
+                    path_chain=self._path.middleware,
+                )
+                for host, tree in self._hosts_exact.items()
+            },
+            self._compose_node(self._hosts_param, self._hosts_param, param_host=True),
+            self._has_param_hosts,
+            self._host_routing,
         )
-        return path_handler, path_match
 
-    def _registration_tree(self, pattern: UrlPath) -> Node:
-        if pattern.host:
-            self._has_hosts = True
-            return self._hosts
-        return self._path
+    def _compose_node(
+        self,
+        node: Node,
+        orig_tree: Node,
+        *,
+        param_host: bool,
+        chain: tuple[Middleware, ...] = (),
+        not_found: Handler | None = None,
+        not_found_custom: bool = False,
+        method_na: MethodNotAllowedHandler | None = None,
+        path_node: Node | None = None,
+        path_chain: tuple[Middleware, ...] = (),
+    ) -> Node:
+        """One new `Node` with this node's scope middleware applied.
 
-    def _leaf_node(self, pattern: UrlPath) -> Node:
-        tree = self._registration_tree(pattern)
-        return trie_descend(tree, pattern, create=True, host_tree=tree is self._hosts)
+        `chain` is this tree's middleware root→node; `not_found`/`method_na`
+        are the nearest registered custom handlers in scope. `path_node` /
+        `path_chain` track the hostless `_path` tree along the same segments
+        for `_hosts_exact` trees (`None` elsewhere).
+        """
+        chain = (*chain, *node.middleware)
+        if node.not_found_handler is not None:
+            not_found = node.not_found_handler
+            not_found_custom = node.not_found_custom
+        if node.method_not_allowed_handler is not None:
+            method_na = node.method_not_allowed_handler
+        scoped = (*chain, *path_chain)
 
-    def _policy_node(self, pattern: UrlPath | str) -> Node:
-        route = _as_pattern(pattern)
-        if any(segment.kind == "catchall" for segment in route.host):
+        out = Node(not_found_custom=not_found_custom)
+        if scoped or not_found is not None:
+            out.not_found_handler = _wrap(not_found or default_not_found, scoped)
+        if method_na is not None and not scoped:
+            out.method_not_allowed_handler = method_na
+        elif scoped or method_na is not None:
+            factory = method_na or method_not_allowed_handler
+
+            def wrapped_na(
+                allowed: frozenset[str],
+                f: MethodNotAllowedHandler = factory,
+                mws: tuple[Middleware, ...] = scoped,
+            ) -> Handler:
+                return _wrap(f(allowed), mws)
+
+            out.method_not_allowed_handler = wrapped_na
+        if node.endpoints:
+            out.endpoints = {}
+            for method, endpoint in node.endpoints.items():
+                endpoint_mws = self._endpoint_scope(
+                    endpoint.route, orig_tree, param_host
+                )
+                wrapped = _wrap(endpoint.handler, (*endpoint_mws, *endpoint.middleware))
+                if wrapped is not endpoint.handler:
+                    require_async_handler(wrapped, what="Composed handler")
+                out.endpoints[method] = Endpoint(
+                    handler=wrapped,
+                    route=endpoint.route,
+                    middleware=endpoint.middleware,
+                )
+
+        def child_args(
+            kind: str, name: str
+        ) -> tuple[Node | None, tuple[Middleware, ...]]:
+            if path_node is None:
+                return None, path_chain
+            pchild = _path_step(path_node, kind, name)
+            if pchild is None:
+                return None, path_chain
+            return pchild, (*path_chain, *pchild.middleware)
+
+        for name, child in node.exact.items():
+            pnode, pchain = child_args("exact", name)
+            out.exact[name] = self._compose_node(
+                child,
+                orig_tree,
+                param_host=param_host,
+                chain=chain,
+                not_found=not_found,
+                not_found_custom=not_found_custom,
+                method_na=method_na,
+                path_node=pnode,
+                path_chain=pchain,
+            )
+        for kind, cname, cnode in (
+            ("wildcard", node.wildcard_name, node.wildcard),
+            ("catchall", node.catchall_name, node.catchall),
+        ):
+            if cnode is None or cname is None:
+                continue
+            pnode, pchain = child_args(kind, cname)
+            composed = self._compose_node(
+                cnode,
+                orig_tree,
+                param_host=param_host,
+                chain=chain,
+                not_found=not_found,
+                not_found_custom=not_found_custom,
+                method_na=method_na,
+                path_node=pnode,
+                path_chain=pchain,
+            )
+            if kind == "wildcard":
+                out.wildcard_name = cname
+                out.wildcard = composed
+            else:
+                out.catchall_name = cname
+                out.catchall = composed
+        return out
+
+    def _endpoint_scope(
+        self, route: Route, orig_tree: Node, param_host: bool
+    ) -> list[Middleware]:
+        walk_host = route.host_segments if param_host else ()
+        scoped = _collect_middleware(orig_tree, walk_host, route.path_segments)
+        if route.host:
+            scoped += _collect_middleware(self._path, (), route.path_segments)
+        return scoped
+
+    def _tree_for(self, route: Route) -> Node:
+        if not route.host:
+            return self._path
+        self._host_routing = True
+        if all(segment.kind == "exact" for segment in route.host_segments):
+            return self._hosts_exact.setdefault(route.host, Node())
+        self._has_param_hosts = True
+        return self._hosts_param
+
+    def _descend(self, tree: Node, route: Route) -> Node:
+        current = tree
+        if tree is self._hosts_param:
+            for segment in route.host_segments[::-1]:
+                current = _descend_or_create(current, segment)
+        for segment in route.path_segments:
+            current = _descend_or_create(current, segment)
+        return current
+
+    def _policy_node(self, pattern: str) -> Node:
+        route = Route(pattern)
+        if any(segment.kind == "catchall" for segment in route.host_segments):
             raise StarioError(
                 "Catchall host policy is not supported",
-                context={"pattern": route.text},
-                help_text=(
-                    "Use an exact host prefix such as "
-                    "UrlPath('/', host='api.example.com') or apply path policy like '/api'."
-                ),
+                context={"target": route.target},
             )
-        if route.path and route.path[-1].kind == "catchall":
+        if route.path_segments and route.path_segments[-1].kind == "catchall":
             raise StarioError(
                 "Catchall route policy cannot have child routes",
-                context={"pattern": route.text},
-                help_text="Use a non-catchall prefix such as '/api' for route policy.",
+                context={"target": route.target},
             )
-        return self._leaf_node(route)
+        tree = self._tree_for(route)
+        return self._descend(tree, route)
 
-    def use(self, pattern: UrlPath | str, *middleware: Middleware) -> None:
+    def use(self, pattern: str, *middleware: Middleware) -> None:
+        self._check_frozen()
         current = self._policy_node(pattern)
         if not middleware:
             return
-        if _branch_has_endpoints(current):
-            raise StarioError(
-                "Middleware must be registered before matching routes",
-                context={"pattern": pattern},
-                help_text=(
-                    "Call app.use(pattern, ...) before app.add(...) or app.get/post on that prefix. "
-                    "Middleware is baked into route handlers at registration time."
-                ),
-            )
         current.middleware = current.middleware + tuple(middleware)
-        self._clear_match_cache()
+        self._invalidate_lookup()
 
-    def not_found(self, pattern: UrlPath | str, handler: Handler) -> None:
-        self._policy_node(pattern).not_found_handler = handler
-        self._clear_match_cache()
+    def not_found(self, pattern: str, handler: Handler) -> None:
+        self._check_frozen()
+        require_async_handler(handler, what="Not-found handler")
+        node = self._policy_node(pattern)
+        node.not_found_handler = handler
+        node.not_found_custom = True
+        self._invalidate_lookup()
 
     def method_not_allowed(
         self,
-        pattern: UrlPath | str,
+        pattern: str,
         handler: MethodNotAllowedHandler,
     ) -> None:
-        self._policy_node(pattern).method_not_allowed_handler = handler
-        self._clear_match_cache()
+        self._check_frozen()
 
-    def handle(
-        self,
-        method: str,
-        path: UrlPath | str,
-        handler: Handler,
-        *,
-        middleware: Sequence[Middleware] = (),
-    ) -> None:
-        route = _as_pattern(path)
-        method = method.upper()
-        tree = self._registration_tree(route)
-        scoped_middleware = _collect_middleware(tree, route)
-        if route.host:
-            scoped_middleware.extend(
-                _collect_middleware(self._path, route, path_only=True)
-            )
+        def checked(allowed: frozenset[str]) -> Handler:
+            resolved = handler(allowed)
+            require_async_handler(resolved, what="Method-not-allowed handler")
+            return resolved
 
-        current = trie_descend(tree, route, create=True, host_tree=tree is self._hosts)
-
-        wrapped = handler
-        for mw in reversed([*scoped_middleware, *middleware]):
-            wrapped = mw(wrapped)
-
-        existing = None if current.endpoints is None else current.endpoints.get(method)
-        if existing is not None:
-            raise StarioError(
-                "Route already registered",
-                context={"method": method, "pattern": route.text},
-                help_text="Each HTTP method may be registered only once per route pattern.",
-            )
-
-        endpoint = Endpoint(
-            handler=wrapped,
-            route_match=RouteMatch(
-                pattern=route.text,
-                params=EMPTY_ROUTE_MATCH.params,
-            ),
-        )
-        if current.endpoints is None:
-            current.endpoints = {method: endpoint}
-        else:
-            current.endpoints[method] = endpoint
-        if method not in current.methods:
-            current.methods = current.methods | frozenset({method})
-        self._clear_match_cache()
+        self._policy_node(pattern).method_not_allowed_handler = checked
+        self._invalidate_lookup()
 
     def add(
         self,
@@ -524,80 +515,32 @@ class Router:
         *,
         middleware: Sequence[Middleware] = (),
     ) -> None:
-        """Register a `Route`. Path + method stay on `handle()`."""
-        self.handle(route.method, route.path, handler, middleware=middleware)
+        self._check_frozen()
+        require_async_handler(handler)
+        if route is EMPTY_ROUTE:
+            raise StarioError("Cannot register the unmatched route")
+        if not route.method:
+            raise StarioError(
+                "Cannot register a prefix route",
+                context={"target": route.target},
+            )
+        method = route.method
+        tree = self._tree_for(route)
+        current = self._descend(tree, route)
 
-    def get(
-        self,
-        path: UrlPath | str,
-        handler: Handler,
-        *,
-        middleware: Sequence[Middleware] = (),
-    ) -> None:
-        self.handle("GET", path, handler, middleware=middleware)
+        existing = None if current.endpoints is None else current.endpoints.get(method)
+        if existing is not None:
+            raise StarioError(
+                "Route already registered",
+                context={"method": method, "target": route.target},
+            )
 
-    def query(
-        self,
-        path: UrlPath | str,
-        handler: Handler,
-        *,
-        middleware: Sequence[Middleware] = (),
-    ) -> None:
-        self.handle("QUERY", path, handler, middleware=middleware)
-
-    def post(
-        self,
-        path: UrlPath | str,
-        handler: Handler,
-        *,
-        middleware: Sequence[Middleware] = (),
-    ) -> None:
-        self.handle("POST", path, handler, middleware=middleware)
-
-    def put(
-        self,
-        path: UrlPath | str,
-        handler: Handler,
-        *,
-        middleware: Sequence[Middleware] = (),
-    ) -> None:
-        self.handle("PUT", path, handler, middleware=middleware)
-
-    def delete(
-        self,
-        path: UrlPath | str,
-        handler: Handler,
-        *,
-        middleware: Sequence[Middleware] = (),
-    ) -> None:
-        self.handle("DELETE", path, handler, middleware=middleware)
-
-    def patch(
-        self,
-        path: UrlPath | str,
-        handler: Handler,
-        *,
-        middleware: Sequence[Middleware] = (),
-    ) -> None:
-        self.handle("PATCH", path, handler, middleware=middleware)
-
-    def head(
-        self,
-        path: UrlPath | str,
-        handler: Handler,
-        *,
-        middleware: Sequence[Middleware] = (),
-    ) -> None:
-        self.handle("HEAD", path, handler, middleware=middleware)
-
-    def options(
-        self,
-        path: UrlPath | str,
-        handler: Handler,
-        *,
-        middleware: Sequence[Middleware] = (),
-    ) -> None:
-        self.handle("OPTIONS", path, handler, middleware=middleware)
+        endpoint = Endpoint(handler=handler, route=route, middleware=tuple(middleware))
+        if current.endpoints is None:
+            current.endpoints = {method: endpoint}
+        else:
+            current.endpoints[method] = endpoint
+        self._invalidate_lookup()
 
 
 __all__ = [

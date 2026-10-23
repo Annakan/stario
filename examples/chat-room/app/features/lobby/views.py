@@ -6,12 +6,12 @@ from app.common.identity import VISITOR_SESSION_INIT, VisitorIdentity
 from app.common.shell import page
 from app.features.room.models import Room
 from app.features.room.urls import CREATE, DELETE, ROOM
+from stario import h
 from stario.datastar import at, data
 from stario.debug import debug_inspector
 from stario.markup import HtmlElement
-from stario.markup import html as h
 
-from .urls import SUBSCRIBE
+from .urls import LIVE
 
 
 def lobby_live_view(
@@ -72,7 +72,7 @@ def lobby_view(
                     if_missing=True,
                 ),
                 data.init(
-                    f"{VISITOR_SESSION_INIT}\n{at.fetch(SUBSCRIBE, retry='always')}"
+                    f"{VISITOR_SESSION_INIT}\n{at.get(LIVE.href(), retry='always')}"
                 ),
                 lobby_live_view(rooms=rooms, online_counts=online_counts),
             ),
@@ -85,7 +85,18 @@ def _create_room_dialog() -> HtmlElement:
         {"id": "create-room-dialog", "class": "room-dialog"},
         h.Form(
             {"class": "room-dialog-form"},
-            data.on("submit", "evt.preventDefault()"),
+            data.on(
+                "submit",
+                f"""
+                if ($room_title.trim()) {{
+                    {at.post(CREATE.href())};
+                    $room_title = '';
+                    $room_description = '';
+                    el.closest('dialog').close();
+                }}
+                """,
+                prevent=True,
+            ),
             h.H2({"class": "room-dialog-title"}, "New room"),
             h.Label(
                 {"class": "room-dialog-label"},
@@ -120,19 +131,8 @@ def _create_room_dialog() -> HtmlElement:
                     "Cancel",
                 ),
                 h.Button(
-                    {"type": "button", "class": "room-dialog-create"},
+                    {"type": "submit", "class": "room-dialog-create"},
                     data.attrs({"disabled": "!$room_title.trim()"}),
-                    data.on(
-                        "click",
-                        f"""
-                        if ($room_title.trim()) {{
-                            {at.fetch(CREATE)};
-                            $room_title = '';
-                            $room_description = '';
-                            el.closest('dialog').close();
-                        }}
-                        """,
-                    ),
                     "Create",
                 ),
             ),
@@ -160,7 +160,7 @@ def _room_card(room: Room, *, online: int) -> HtmlElement:
                     f"""
                     evt.stopPropagation();
                     if (confirm({confirm_text})) {{
-                        {at.fetch(DELETE, {"room_id": room.id})};
+                        {at.delete(DELETE.href(room.id))};
                     }}
                     """,
                 ),

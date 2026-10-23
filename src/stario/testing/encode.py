@@ -1,19 +1,15 @@
 """Request body encoding and response parsing for TestClient."""
 
-import json as json_module
 import zlib
 from collections.abc import Mapping, Sequence
-from compression import zstd
-from datetime import UTC, datetime
-from email.utils import format_datetime
 from typing import Any
 from urllib.parse import urlencode
-from uuid import uuid7
+from uuid import uuid4
 
-from stario.http.compression import brotli_decompress
+from stario.http.compression import brotli_decompress, zstd_decompress
 from stario.http.headers import Headers
+from stario.json import dumps_bytes as json_dumps_bytes
 from stario.testing.cookies import parse_set_cookie_headers
-from stario.testing.transport import decode_chunked, try_parse_http_head
 from stario.testing.types import FileData, FormData, QueryParamInput
 
 
@@ -41,7 +37,7 @@ def _encode_multipart(
             "Multipart requests accept mapping or sequence form `data` only."
         )
 
-    boundary = f"stario-boundary-{uuid7().hex}"
+    boundary = f"stario-boundary-{uuid4().hex}"
     parts: list[bytes] = []
 
     if data is not None:
@@ -102,9 +98,7 @@ def encode_request_body(
 ) -> tuple[bytes, str | None]:
     if json is not None:
         return (
-            json_module.dumps(json, separators=(",", ":"), ensure_ascii=False).encode(
-                "utf-8"
-            ),
+            json_dumps_bytes(json),
             "application/json; charset=utf-8",
         )
     if files is not None:
@@ -125,18 +119,6 @@ def encode_request_body(
     return b"", None
 
 
-def parse_http_response(raw: bytes) -> tuple[int, Headers, bytes]:
-    parsed = try_parse_http_head(raw)
-    if parsed is None:
-        raise RuntimeError("Malformed test response: missing header separator.")
-
-    status_code, headers, header_end = parsed
-    body = raw[header_end:]
-    if "chunked" in (headers.get("transfer-encoding") or "").lower():
-        body = decode_chunked(raw, start=header_end)
-    return status_code, headers, body
-
-
 def decode_content_encoding(body: bytes, encoding: str | None) -> bytes:
     # HEAD responses carry Content-Encoding with an empty body; nothing to decode.
     if not encoding or not body:
@@ -149,7 +131,7 @@ def decode_content_encoding(body: bytes, encoding: str | None) -> bytes:
     if normalized == "br":
         return brotli_decompress(body)
     if normalized == "zstd":
-        return zstd.decompress(body)
+        return zstd_decompress(body)
     raise RuntimeError(
         f"TestClient does not support Content-Encoding={encoding!r}; "
         "use Accept-Encoding that yields identity."
@@ -158,8 +140,3 @@ def decode_content_encoding(body: bytes, encoding: str | None) -> bytes:
 
 def parse_response_cookies(headers: Headers) -> dict[str, str]:
     return parse_set_cookie_headers(headers.getlist("set-cookie"))
-
-
-def date_header() -> bytes:
-    now = datetime.now(UTC)
-    return b"date: " + format_datetime(now, usegmt=True).encode("ascii") + b"\r\n"

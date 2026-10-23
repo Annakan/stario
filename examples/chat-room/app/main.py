@@ -3,8 +3,7 @@ Stario Chat Room — multi-file example (larger-app layout).
 
 Run from the project root:
 
-  uv run stario watch app.main:bootstrap
-  uv run stario serve app.main:bootstrap
+  uv run python -m app.main
 
 Start here, then open each layer:
 
@@ -38,7 +37,7 @@ from app.db import Database
 from app.features.lobby.handlers import register_lobby
 from app.features.room import data as room_data
 from app.features.room.handlers import register_room
-from stario import App, Relay, Span, StaticAssets
+from stario import App, Relay, Span
 
 
 async def bootstrap(app: App, span: Span):
@@ -58,10 +57,16 @@ async def bootstrap(app: App, span: Span):
     )
 
     with span.step("static_assets") as s:
-        static = StaticAssets(ASSETS)
-        s.attrs(static.stats)
-    static.register(app)
+        s.attrs(await ASSETS.attach(app))
 
     register_lobby(app, db, relay)
     register_room(app, db, relay)
     yield
+
+
+if __name__ == "__main__":
+    import asyncio
+
+    from stario import serve
+
+    asyncio.run(serve(bootstrap))

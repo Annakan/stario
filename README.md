@@ -23,20 +23,62 @@ Full guides, API reference, and tutorials live at [stario.dev](https://stario.de
 
 ## Where Stario fits
 
-Stario is an asyncio-native HTTP stack: you write async handlers and register routes on an `App`, and the `stario` CLI runs a built-in HTTP server (TCP or a Unix domain socket). It is not an ASGI application you mount in Uvicorn or Hypercorn; wiring goes through the `bootstrap` hook, `Context`, and `Writer` instead.
+Stario is an asyncio-native HTTP stack: you write async handlers and register routes on an `App`, and you start the built-in HTTP server (TCP or a Unix domain socket) with `asyncio.run(stario.serve(bootstrap))` (or `uvloop.run(...)`). It is not an ASGI application you mount in Uvicorn or Hypercorn; wiring goes through the `bootstrap` hook, `Context`, and `Writer` instead.
 
 ## Requirements
 
-Python 3.14 or newer is required. The package tracks current Python and the standard library (including APIs the framework builds on) rather than supporting older runtimes.
+Python 3.12 or newer is required, on Linux (glibc) or macOS. The HTTP server is compiled: PyPI ships wheels for Linux x86_64/aarch64 and macOS arm64 with nghttp2, Brotli, and zstd bundled. Elsewhere `pip` builds from source and needs a C compiler, `pkg-config`, and the nghttp2 (1.66+), Brotli, and zstd development packages. Windows is not supported.
 
-**uvloop (optional):** Stario defaults to the stdlib asyncio loop. For a faster event loop on Linux/macOS, install the optional extra and set `STARIO_LOOP=uvloop`:
+**uvloop (optional):** Stario runs on whatever loop you start. For a faster event loop on Linux/macOS, install the optional extra and call `uvloop.run(serve(bootstrap))` instead of `asyncio.run(...)`:
 
 ```bash
 uv add "stario[uvloop]"
 # or: pip install "stario[uvloop]"
 ```
 
-Then run with `STARIO_LOOP=uvloop stario serve main:bootstrap` (or `stario watch`). uvloop is not supported on Windows.
+uvloop is not supported on Windows. `STARIO_THREADS=N` is N full servers on one TCP port (`SO_REUSEPORT`); each worker thread creates the same loop class as the loop running `serve()`. Without `SO_REUSEPORT` the process stays at one thread.
+
+**Free-threaded workers (optional):** on Python 3.14t, `STARIO_THREADS=N` runs N event loops in one process so handler CPU can use more cores while `Relay` stays in-process. See [`docs/free-threading.md`](docs/free-threading.md).
+
+### JSON codec
+
+Stario uses one process-wide JSON codec for responses, Datastar signals,
+telemetry, and the test client. The default codec uses the standard library and
+emits compact UTF-8 JSON. Replace it explicitly when the application uses
+another library — its encode and decode functions plug in directly:
+
+```python
+import msgspec
+
+import stario.json as stario_json
+
+stario_json.set_codec(msgspec.json.encode, msgspec.json.decode)
+```
+
+orjson has native byte output, so its byte path does not encode text first:
+
+```python
+import orjson
+
+import stario.json as stario_json
+
+stario_json.set_codec(orjson.dumps, orjson.loads)
+```
+
+`encode` returns one compact JSON value as text or UTF-8 bytes; Stario converts
+once where it needs the other form. `dumps()` returns text, `dumps_bytes()`
+returns UTF-8 bytes, and `loads()` accepts text, bytes, or a byte array. Stario
+uses bytes for HTTP and SSE and text for HTML attributes and telemetry storage.
+A byte-native encoder only decodes when a text consumer asks for `dumps()`.
+
+Calling `set_codec()` again replaces the codec for later operations. Stario
+does not synchronize replacement with active requests or telemetry writes.
+Configure during application setup unless changing live serialization is
+intentional. A codec may serialize its native datetime, UUID, Decimal, or model
+types itself.
+
+This is transport configuration only; validation and application models stay
+in application code.
 
 ## Quick start
 
@@ -48,7 +90,7 @@ Clone the repo (or copy an example directory) and run:
 git clone https://github.com/bobowski/stario.git
 cd stario/examples/tiles
 uv sync
-uv run stario watch main:bootstrap
+uv run python -m main
 ```
 
 See [`examples/`](examples/) for **tiles** (recommended), **hello-world**, and **chat-room** (multi-file layout).
@@ -61,18 +103,20 @@ cd my-app
 uv add stario
 ```
 
+For an app rather than a one-file experiment, start from the app guide in [bobowski/stario-create](https://github.com/bobowski/stario-create): copy its `AGENTS.md` into the repo root and install the skills with `npx skills add bobowski/stario-create`.
+
 Put this in `main.py`:
 
 ```python
-import stario.responses as responses
-from stario import App, Context, Route, Span, Writer
+from stario import App, Context, Route, Span, Writer, h
 
 
 async def home(c: Context, w: Writer) -> None:
-    responses.text(w, "Hello from Stario")
+    w.html(h.H1("Hello from Stario"))
 
 
-HOME = Route.get("/")
+HOME = Route("GET", "/")
+
 
 async def bootstrap(app: App, span: Span):
     span.attr("app.name", "example")
@@ -80,17 +124,64 @@ async def bootstrap(app: App, span: Span):
     yield
 ```
 
-```bash
-uv run stario watch main:bootstrap
+Then serve it — `serve` is the only server entry point:
+
+```python
+import asyncio
+from stario import serve
+
+if __name__ == "__main__":
+    asyncio.run(serve(bootstrap))
 ```
 
-Install with `pip install stario` if you are not using uv. During startup, `bootstrap` runs until its single `yield`: register routes and attach attributes to `span` before `yield`; put teardown after `yield` when needed. Use `stario watch` in development so the process reloads when files change; use `stario serve` for a normal long-running server without reload. Server runtime policy (`STARIO_HOST`, `STARIO_PORT`, `STARIO_TRACER`, and related vars) is configured through environment variables — see `stario serve --help` (Stario does not load `.env` files; export vars in your shell or use your own dotenv tooling). See [Getting started](https://stario.dev/docs) for project layout. For containers, TLS, and production-oriented setup, see [Deployment, containers, and TLS](https://stario.dev/docs/how-tos/deployment-containers-and-tls).
+```bash
+uv run python -m main
+```
+
+For development, reload on file changes with watchfiles:
+
+```bash
+uv run --with watchfiles watchfiles 'python -m main' .
+```
+
+Use `uvloop.run(serve(bootstrap))` when you want uvloop. When no
+`config=` is passed, `serve` reads the `STARIO_*` environment variables;
+otherwise pass `config=ServerConfig(host="0.0.0.0", port=9000)`.
+`Server` takes a `ServerConfig` object.
+
+Install with `pip install stario` if you are not using uv. During startup, `bootstrap` runs until its single `yield`: register routes and attach attributes to `span` before `yield`; put teardown after `yield` when needed. Server runtime policy (`STARIO_HOST`, `STARIO_PORT`, `STARIO_TRACER`, and related vars) is configured through environment variables — see `ServerConfig.from_env` (Stario does not load `.env` files; export vars in your shell or use your own dotenv tooling). See [Getting started](https://stario.dev/docs) for project layout. For containers, TLS, and production-oriented setup, see [Deployment, containers, and TLS](https://stario.dev/docs/how-tos/deployment-containers-and-tls).
+
+### Filesystem URLs
+
+Build `Assets` or `Files` at module level. Call `href()` there. Call
+`await attach(app)` in bootstrap (register + load). `Assets` precompresses
+by default; `Files` does not unless you pass `precompress=`:
+
+```python
+from stario import App, Assets, Files, Span
+
+ASSETS = Assets("./static", "/static")
+UPLOADS = Files("./uploads", "/data")
+STYLE_CSS = ASSETS.href("css/style.css")
+
+
+async def bootstrap(app: App, span: Span):
+    span.attrs(await ASSETS.attach(app))
+    await UPLOADS.attach(app, precompress=("br", "gzip"))
+    yield
+```
+
+`Assets` hashes names and 307s the logical path. Both send strong ETags
+and `X-Content-Type-Options: nosniff`.
 
 ## What you get
 
 - Explicit wiring: async-generator `bootstrap(app, span)` with a single `yield`, `Route` endpoints, no hidden registration.
 - Sharp primitives: `Context` for the request, `Writer` for the response, HTML/SVG trees via `stario.markup`, telemetry via `span`.
-- Static assets: `AssetManifest` for fingerprinted URLs, `StaticAssets(manifest).register(app)` in bootstrap.
+- Files: `Assets` and `Files` expose a directory at a URL prefix.
+  `attach(app)` registers GET/HEAD and loads the tree. `Assets`
+  hashes names and 307s the logical path. Both use strong ETags and 304.
+  Import from `stario` or `stario.filesystem`.
 - Hypermedia by default: HTML and SSE are first-class; realtime layers are optional when the product needs them.
 - Observable runs: spans for startup and requests are part of how you structure apps, not an afterthought.
 
@@ -100,7 +191,25 @@ No bundled ORM, admin UI, or plugin discovery system. Databases, auth, and broke
 
 ## Releases
 
-Version history and upgrade notes live in [`CHANGELOG.md`](CHANGELOG.md).
+The bump commit is the source of truth. The tag must name that version.
+There is no autotag, and the build does not rewrite the version.
+
+1. Keep notes under `## Unreleased` in [`CHANGELOG.md`](CHANGELOG.md).
+2. When those notes are the release, one commit:
+   - set `version` in `pyproject.toml` (for example `5.0.0`)
+   - move `## Unreleased` to `## 5.0.0 - YYYY-MM-DD` and leave an empty
+     `## Unreleased` above it
+3. Tag that commit and push:
+
+```bash
+git tag 5.0.0
+git push origin 5.0.0
+```
+
+A GitHub Release with the same tag is the same event. The workflow tests
+3.12–3.14, checks that the tag, `pyproject.toml`, and changelog agree,
+then uploads `stario-5.0.0` to PyPI. If the tag does not match the
+committed version, the job fails.
 
 ## Contributing
 

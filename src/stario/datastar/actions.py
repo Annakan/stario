@@ -6,12 +6,13 @@ Use the exported `at` instance:
 from stario import Route
 from stario.datastar import at, data
 
-REFRESH = Route.get("/items")
-h.Button(data.on("click", at.fetch(REFRESH)), "Refresh")
+REFRESH = Route("GET /items")
+h.Button(data.on("click", at.get(REFRESH.href())), "Refresh")
 ```
 
 The methods return strings such as `@get('/items')` for use inside Datastar
-attributes like `data.on(...)`. Prefer `at.fetch(route)` when the URL is a `Route`.
+attributes like `data.on(...)`. Build the URL with `route.href()`, then
+pick `at.get` / `at.post` / … at the call site.
 """
 
 from collections.abc import Mapping
@@ -19,7 +20,6 @@ from typing import Any, Literal
 from urllib.parse import urlencode
 
 from stario.exceptions import StarioError
-from stario.routing import Route
 
 from .format import FilterValue, filter_js, js_object, string_literal
 
@@ -85,8 +85,10 @@ class DatastarActions:
     ) -> str:
         """Build a Datastar backend fetch action.
 
-        Values in `payload` are JavaScript expressions. Wrap literal text with
-        `string_literal()` so it is emitted as a JS string.
+        Values in `payload` are JavaScript expressions evaluated in the
+        browser. Never pass user-supplied text as a `payload` value — wrap
+        literal text with `string_literal()` or send it as a signal. Values in
+        `headers` are already string literals and are safe for literal text.
         """
         if selector is not None and content_type != "form":
             raise StarioError(
@@ -173,6 +175,10 @@ class DatastarActions:
     ) -> str:
         """Build `@get(...)`.
 
+        Warning: `payload` string values are JavaScript expressions evaluated
+        in the browser — never pass user-supplied text there; wrap it with
+        `string_literal()` or send it as a signal.
+
         ```python
         h.Button(data.on("click", at.get("/items", {"q": "$query"})), "Search")
         ```
@@ -215,7 +221,12 @@ class DatastarActions:
         retry_max_count: int | None = None,
         request_cancellation: RequestCancellation | str | None = None,
     ) -> str:
-        """Build `@post(...)` with the same option surface as `get`."""
+        """Build `@post(...)` with the same option surface as `get`.
+
+        Warning: `payload` string values are JavaScript expressions evaluated
+        in the browser — never pass user-supplied text there; wrap it with
+        `string_literal()` or send it as a signal.
+        """
         return self._fetch(
             "post",
             url,
@@ -254,7 +265,12 @@ class DatastarActions:
         retry_max_count: int | None = None,
         request_cancellation: RequestCancellation | str | None = None,
     ) -> str:
-        """Build `@put(...)` with the same option surface as `get`."""
+        """Build `@put(...)` with the same option surface as `get`.
+
+        Warning: `payload` string values are JavaScript expressions evaluated
+        in the browser — never pass user-supplied text there; wrap it with
+        `string_literal()` or send it as a signal.
+        """
         return self._fetch(
             "put",
             url,
@@ -293,7 +309,12 @@ class DatastarActions:
         retry_max_count: int | None = None,
         request_cancellation: RequestCancellation | str | None = None,
     ) -> str:
-        """Build `@patch(...)` with the same option surface as `get`."""
+        """Build `@patch(...)` with the same option surface as `get`.
+
+        Warning: `payload` string values are JavaScript expressions evaluated
+        in the browser — never pass user-supplied text there; wrap it with
+        `string_literal()` or send it as a signal.
+        """
         return self._fetch(
             "patch",
             url,
@@ -332,7 +353,12 @@ class DatastarActions:
         retry_max_count: int | None = None,
         request_cancellation: RequestCancellation | str | None = None,
     ) -> str:
-        """Build `@delete(...)` with the same option surface as `get`."""
+        """Build `@delete(...)` with the same option surface as `get`.
+
+        Warning: `payload` string values are JavaScript expressions evaluated
+        in the browser — never pass user-supplied text there; wrap it with
+        `string_literal()` or send it as a signal.
+        """
         return self._fetch(
             "delete",
             url,
@@ -352,14 +378,11 @@ class DatastarActions:
             request_cancellation=request_cancellation,
         )
 
-    def fetch(
+    def query(
         self,
-        route: Route,
-        params: Mapping[str, object] | None = None,
-        /,
+        url: str,
+        queries: Mapping[str, Any] | None = None,
         *,
-        query: Mapping[str, object] | None = None,
-        fragment: str | None = None,
         content_type: ContentType | str | None = None,
         include: FilterValue | None = None,
         exclude: FilterValue | None = None,
@@ -374,25 +397,17 @@ class DatastarActions:
         retry_max_count: int | None = None,
         request_cancellation: RequestCancellation | str | None = None,
     ) -> str:
-        """Build `@get` / `@post` / `@put` / `@patch` / `@delete` from a `Route`.
+        """Build `@query(...)` with the same option surface as `get`.
 
-        Path params, `query=`, and `fragment=` match `href()`. Datastar fetch
-        options stay keyword-only so they do not collide with path names.
-
-        ```python
-        data.init(at.fetch(SUBSCRIBE, {"room_id": room.id}, retry="always"))
-        h.Button(data.on("click", at.fetch(SEND, {"room_id": room.id})), "Send")
-        ```
+        Sends a `QUERY` request with signals in the body, like `post`.
+        Warning: `payload` string values are JavaScript expressions evaluated
+        in the browser — never pass user-supplied text there; wrap it with
+        `string_literal()` or send it as a signal.
         """
-        if route.method not in {"GET", "POST", "PUT", "PATCH", "DELETE"}:
-            raise StarioError(
-                "at.fetch() has no Datastar action for this method",
-                context={"method": route.method, "path": route.path.text},
-                help_text="at.fetch() emits @get, @post, @put, @patch, or @delete.",
-            )
         return self._fetch(
-            route.method.lower(),
-            route.href(params, query=query, fragment=fragment),
+            "query",
+            url,
+            queries,
             content_type=content_type,
             include=include,
             exclude=exclude,

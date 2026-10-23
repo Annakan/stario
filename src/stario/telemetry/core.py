@@ -7,6 +7,8 @@ create spans and export finished records on `end()`. Enter a tracer before
 creating spans so background writers and sinks are active.
 """
 
+from __future__ import annotations
+
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol
@@ -118,6 +120,7 @@ class Span(Protocol):
         /,
     ) -> None: ...
     def fail(self, message: str) -> None: ...
+    def rename(self, name: str) -> None: ...
     def end(self) -> None: ...
 
 

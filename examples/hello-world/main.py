@@ -5,17 +5,14 @@ One route, one handler, one HTML page. This file is the smallest complete
 Stario app: a `Route`, a handler that writes through `Writer`, and a
 `bootstrap` that registers the route.
 
-Run with: uv run stario watch main:bootstrap
-      or: uv run stario serve main:bootstrap
+Run with: uv run python -m main
 
 For Datastar, SSE, and shared state, see `examples/tiles`.
 """
 
-import stario.responses as responses
-from stario import App, Context, Route, Span, Writer
-from stario.markup import html as h
+from stario import App, Context, Route, Span, Writer, h
 
-HOME = Route.get("/")
+HOME = Route("GET", "/")
 
 
 def home_view():
@@ -39,10 +36,18 @@ def home_view():
 
 
 async def home(c: Context, w: Writer) -> None:
-    responses.html(w, home_view())
+    w.html(home_view())
 
 
 async def bootstrap(app: App, span: Span):
     span.attr("app.name", "hello-world")
     app.add(HOME, home)
     yield
+
+
+if __name__ == "__main__":
+    import asyncio
+
+    from stario import serve
+
+    asyncio.run(serve(bootstrap))

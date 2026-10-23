@@ -7,13 +7,13 @@ import signal
 import socket
 import stat
 import tempfile
+import time
 from io import StringIO
 from typing import Any
 
 import pytest
 
-import stario.responses as responses
-from stario import App
+from stario import App, Route
 from stario.exceptions import StarioError
 from stario.http.config import RequestPolicy, ServerConfig
 from stario.http.server import Server
@@ -42,6 +42,48 @@ class TestContextCreateTask:
 
         await asyncio.sleep(0)
         assert not context.app.tasks
+
+    async def test_eager_task_completes_without_registration(self) -> None:
+        context = make_context(loop=asyncio.get_running_loop())
+        started = False
+
+        async def worker() -> int:
+            nonlocal started
+            started = True
+            return 42
+
+        task = context.app.create_task(worker(), eager_start=True)
+
+        assert started
+        assert task.done()
+        assert task.result() == 42
+        assert task not in context.app.tasks
+
+    async def test_task_construction_bypasses_loop_task_factory(self) -> None:
+        loop = asyncio.get_running_loop()
+        context = make_context(loop=loop)
+        calls = 0
+        previous = loop.get_task_factory()
+
+        def factory(loop, coro, **kwargs):
+            nonlocal calls
+            calls += 1
+            return asyncio.Task(coro, loop=loop, **kwargs)
+
+        async def worker() -> int:
+            await asyncio.sleep(0)
+            return 42
+
+        loop.set_task_factory(factory)
+        try:
+            task = context.app.create_task(worker(), name="direct-task")
+        finally:
+            loop.set_task_factory(previous)
+
+        assert calls == 0
+        assert task.get_loop() is loop
+        assert task.get_name() == "direct-task"
+        assert await task == 42
 
 
 class TestServerConstructorValidation:
@@ -99,7 +141,7 @@ async def _connect_with_retry(
         while True:
             try:
                 return await asyncio.open_unix_connection(path)
-            except ConnectionRefusedError, FileNotFoundError:
+            except (ConnectionRefusedError, FileNotFoundError):
                 await asyncio.sleep(0.005)
 
 
@@ -127,9 +169,9 @@ class TestServerRunLifecycle:
             apps.append(app)
 
             async def hello(c, w):
-                responses.text(w, "hello")
+                w.text("hello")
 
-            app.get("/", hello)
+            app.add(Route("GET /"), hello)
             yield
 
         server = Server(
@@ -150,10 +192,7 @@ class TestServerRunLifecycle:
             assert body == b"hello"
         finally:
             # Trigger shutdown the same way the signal handler does.
-            drain = apps[0].shutdown
-            assert drain is not None
-            if not drain.done():
-                drain.set_result(None)
+            apps[0].signal_shutdown()
             async with asyncio.timeout(2.0):
                 await run_task
 
@@ -162,7 +201,9 @@ class TestServerRunLifecycle:
         spans = [json.loads(line) for line in output.getvalue().splitlines()]
         names = [s["name"] for s in spans]
         assert "server.startup" in names
-        assert "GET" in names
+        assert "GET /" in names
+        request_span = next(s for s in spans if s["name"] == "GET /")
+        assert request_span["attributes"]["request.method"] == "GET"
         shutdown_span = next(s for s in spans if s["name"] == "server.shutdown")
         assert shutdown_span["attributes"]["server.shutdown.trigger"] == "expected_stop"
         assert shutdown_span["status"] == "ok"
@@ -219,8 +260,7 @@ class TestServerRunLifecycle:
         reader, writer = await _connect_with_retry(socket_path)
         try:
             # Idle connection: never sends a request; drain closes it immediately.
-            drain = apps[0].shutdown
-            drain.set_result(None)
+            apps[0].signal_shutdown()
             async with asyncio.timeout(2.0):
                 await run_task
 
@@ -250,9 +290,9 @@ class TestServerRunLifecycle:
             apps.append(app)
 
             async def hello(c, w):
-                responses.text(w, "hello")
+                w.text("hello")
 
-            app.get("/", hello)
+            app.add(Route("GET /"), hello)
             yield
 
         server = Server(
@@ -270,7 +310,7 @@ class TestServerRunLifecycle:
             assert status == 200
             assert body == b"hello"
 
-            apps[0].shutdown.set_result(None)
+            apps[0].signal_shutdown()
             async with asyncio.timeout(2.0):
                 await run_task
 
@@ -300,7 +340,7 @@ class TestServerRunLifecycle:
                 handler_started.set()
                 await asyncio.Event().wait()
 
-            app.get("/", slow)
+            app.add(Route("GET /"), slow)
             yield
 
         server = Server(
@@ -316,7 +356,7 @@ class TestServerRunLifecycle:
             await writer.drain()
             await handler_started.wait()
 
-            apps[0].shutdown.set_result(None)
+            apps[0].signal_shutdown()
             server._urgent_drain = True
 
             async with asyncio.timeout(2.0):
@@ -331,6 +371,120 @@ class TestServerRunLifecycle:
         assert shutdown_span["attributes"]["server.shutdown.urgent"] is True
         assert shutdown_span["attributes"]["server.shutdown.cancelled_tasks"] == 1
 
+    async def test_shutdown_aborts_write_blocked_transport(
+        self, short_socket_path
+    ) -> None:
+        """A client that never reads must not stall wait_closed(): the drain
+        aborts transports that close() would flush forever."""
+        socket_path = short_socket_path
+        output = StringIO()
+        tracer = JsonTracer(output)
+        apps: list[App] = []
+
+        async def serve_bootstrap(app: App, span: Any):
+            apps.append(app)
+
+            async def big(_c, w) -> None:
+                w.write_headers(200)
+                for _ in range(160):  # ~10 MiB, no drain
+                    w.write(b"z" * 65536)
+                w.end()
+
+            app.add(Route("GET /big"), big)
+            yield
+
+        server = Server(
+            serve_bootstrap,
+            tracer,
+            config=ServerConfig(
+                unix_socket=socket_path,
+                requests=RequestPolicy(write_timeout=60.0),
+                graceful_shutdown_timeout=0.1,
+            ),
+        )
+
+        run_task = asyncio.create_task(_serve(server))
+        reader, writer = await _connect_with_retry(socket_path)
+        try:
+            writer.write(b"GET /big HTTP/1.1\r\nHost: t\r\n\r\n")
+            await writer.drain()
+            await asyncio.sleep(0.1)  # let the write buffer fill
+            await reader.read(1)  # response bytes are flowing
+
+            t0 = time.monotonic()
+            apps[0].signal_shutdown()
+            # graceful(0.1) + force cap(0.1) + abort — never write_timeout.
+            async with asyncio.timeout(4.0):
+                await run_task
+            assert time.monotonic() - t0 < 3.0
+        finally:
+            writer.close()
+
+        spans = [json.loads(line) for line in output.getvalue().splitlines()]
+        shutdown_span = next(s for s in spans if s["name"] == "server.shutdown")
+        assert shutdown_span["attributes"]["server.shutdown.aborted"] >= 1
+
+    async def test_shutdown_delivers_response_to_steady_reader(
+        self, short_socket_path
+    ) -> None:
+        """A close()d transport gets the whole force-close budget to flush;
+        a client that keeps reading must see the complete body, not an abort."""
+        socket_path = short_socket_path
+        output = StringIO()
+        tracer = JsonTracer(output)
+        apps: list[App] = []
+        body_len = 4 * 1024 * 1024
+
+        async def serve_bootstrap(app: App, span: Any):
+            apps.append(app)
+
+            async def big(_c, w) -> None:
+                w.write_headers(200)
+                for _ in range(body_len // 65536):
+                    w.write(b"z" * 65536)
+                w.end()
+
+            app.add(Route("GET /big"), big)
+            yield
+
+        server = Server(
+            serve_bootstrap,
+            tracer,
+            config=ServerConfig(
+                unix_socket=socket_path,
+                requests=RequestPolicy(write_timeout=60.0),
+                graceful_shutdown_timeout=0.5,
+            ),
+        )
+
+        run_task = asyncio.create_task(_serve(server))
+        reader, writer = await _connect_with_retry(socket_path)
+        try:
+            writer.write(b"GET /big HTTP/1.1\r\nHost: t\r\n\r\n")
+            await writer.drain()
+            head = await reader.readuntil(b"\r\n\r\n")
+            assert b" 200 " in head
+
+            # The client pauses so bytes are still buffered when drain begins.
+            await asyncio.sleep(0.05)
+            apps[0].signal_shutdown()
+
+            received = bytearray()
+            async with asyncio.timeout(4.0):
+                # Steady reads: the transport flush completes inside the budget.
+                while chunk := await reader.read(65536):
+                    received += chunk
+                await run_task
+            # Chunked framing: the terminator and every payload byte arrived.
+            assert received.endswith(b"0\r\n\r\n")
+            assert received.count(b"z") == body_len
+        finally:
+            writer.close()
+
+        spans = [json.loads(line) for line in output.getvalue().splitlines()]
+        shutdown_span = next(s for s in spans if s["name"] == "server.shutdown")
+        assert shutdown_span["attributes"]["server.shutdown.aborted"] == 0
+
     async def test_shutdown_span_survives_second_sigint_after_stop_requested(
         self, short_socket_path
     ) -> None:
@@ -344,9 +498,9 @@ class TestServerRunLifecycle:
             apps.append(app)
 
             async def hello(c, w):
-                responses.text(w, "hello")
+                w.text("hello")
 
-            app.get("/", hello)
+            app.add(Route("GET /"), hello)
             yield
 
         server = Server(
@@ -362,7 +516,7 @@ class TestServerRunLifecycle:
             await writer.drain()
             await _read_http_response(reader)
 
-            apps[0].shutdown.set_result(None)
+            apps[0].signal_shutdown()
             await asyncio.sleep(0.01)
             os.kill(os.getpid(), signal.SIGINT)
 

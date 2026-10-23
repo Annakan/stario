@@ -1,75 +1,94 @@
-"""
-Request-scoped bundle for handlers: app, request, telemetry, routing, state, and client lifetime.
+"""Request-scoped handler bundle: Protocol plus route match and ``alive()``.
+
+Production ``c`` is the Cython ``RequestHandle`` (one per handler call, in front
+of the pooled ``RequestExchange``). TestClient supplies its own
+context. ``Match`` and ``_Alive`` stay as small Python helpers.
 """
 
+from __future__ import annotations
+
 import asyncio
-import contextlib
 from collections.abc import AsyncIterable, AsyncIterator, Awaitable, Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, overload
+from typing import TYPE_CHECKING, Any, Protocol, overload
 
 from stario.telemetry.core import Span
 
-from .request import Request
-from .writer import Writer
+_NO_PARAMS: MappingProxyType[str, str] = MappingProxyType({})
+
+
+class Match:
+    """Immutable hit: pattern plus this request's captures."""
+
+    __slots__ = ("params", "pattern")
+
+    def __init__(
+        self,
+        pattern: str,
+        params: Mapping[str, str] = _NO_PARAMS,
+    ) -> None:
+        object.__setattr__(self, "pattern", pattern)
+        if not params:
+            frozen: Mapping[str, str] = _NO_PARAMS
+        elif isinstance(params, MappingProxyType):
+            frozen = params
+        else:
+            frozen = MappingProxyType(params)
+        object.__setattr__(self, "params", frozen)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise AttributeError("Match is immutable")
+
+    def __repr__(self) -> str:
+        if not self.pattern:
+            return "Match.empty"
+        return f"Match({self.pattern!r})"
+
+    @classmethod
+    def empty(cls) -> Match:
+        """Unmatched 404 / 405 sentinel."""
+        return EMPTY_MATCH
+
+
+EMPTY_MATCH = Match.__new__(Match)
+object.__setattr__(EMPTY_MATCH, "pattern", "")
+object.__setattr__(EMPTY_MATCH, "params", _NO_PARAMS)
 
 if TYPE_CHECKING:
-    from .app import App
+    from stario.http.app import App
+    from stario.http.request import Request
+    from stario.http.writer import Writer
 
 
-@dataclass(slots=True, frozen=True)
-class RouteMatch:
-    """Result of routing: a canonical pattern string plus captured path/host segments."""
-
-    pattern: str
-    """Matched route template (useful for logs), including host part when present."""
-    params: Mapping[str, str]
-    """Map from `{param}` / `{rest...}` names to decoded segment text."""
-
-
-EMPTY_ROUTE_MATCH = RouteMatch(pattern="", params=MappingProxyType({}))
-
-
-@dataclass(slots=True)
-class Context:
-    """Per-request bundle passed to every handler and middleware (routing fills `route` before the handler runs)."""
+class Context(Protocol):
+    """Per-request bundle passed to every handler and middleware."""
 
     app: App
-    """The `App` instance for this request."""
     req: Request
-    """Parsed HTTP request (method, path, headers, body reader)."""
     span: Span
-    """Telemetry span for this request; started/ended by the app callable."""
-    _disconnect: asyncio.Future[None] = field(repr=False)
-    """Completes when the client closes this request's connection."""
-    state: dict[str, Any] = field(default_factory=lambda: {})
-    """Mutable dict for middleware to pass data to inner layers and the handler."""
-    route: RouteMatch = field(default=EMPTY_ROUTE_MATCH)
-    """Filled by `App.__call__` before the handler runs; do not assign in handlers."""
+    state: dict[str, Any]
+    match: Match
 
     @property
     def disconnect(self) -> asyncio.Future[None]:
         """Completes when the client closes this request's connection."""
-        return self._disconnect
+        ...
 
     @property
     def disconnected(self) -> bool:
-        """`True` when the client closed this request's connection."""
-        return self._disconnect.done()
+        """``True`` when the client closed this request's connection."""
+        ...
 
     @property
     def shutting_down(self) -> bool:
-        """`True` when the server is draining this app (same signal as `app.shutting_down`)."""
-        return self.app.shutting_down
+        """``True`` when the server is draining this app."""
+        ...
 
     @property
     def closing(self) -> bool:
-        """`True` when handler work should stop because the client left or the app is draining.
-
-        For response I/O during drain, `Writer` may still write until `disconnected`.
-        """
-        return self.disconnected or self.shutting_down
+        """``True`` when handler work should stop (client left or app draining)."""
+        ...
 
     @overload
     def alive(self, source: None = None) -> _Alive[None]: ...
@@ -87,18 +106,48 @@ class Context:
         `async for item in c.alive(source): ...` to stream from `source` until
         disconnect or shutdown. Do not use `async for` without `source`; the
         context-manager form is the supported no-source pattern.
+
+        The `async for` form swallows the disconnect/shutdown cancel only
+        while it waits on `source`. If the loop body itself awaits, that
+        cancel lands inside the body and propagates. To have it swallowed
+        anywhere in the block, wrap the iteration instead:
+
+        ```python
+        async with c.alive():
+            async for item in source:
+                await send(item)
+        ```
         """
-        return _Alive(self, source)
+        ...
 
 
 @dataclass(slots=True)
 class _Alive[T]:
-    """Connection lifecycle helper bound to a request context."""
+    """Connection lifecycle helper bound to a request context.
+
+    A done-callback on the disconnect/shutdown futures cancels the handler
+    task; ``__aexit__`` swallows only that cancel. The bookkeeping mirrors
+    ``asyncio.timeout``: ``uncancel()`` below the count recorded at enter
+    means the cancel was ours — a foreign cancel raced with ours still
+    propagates, and a foreign cancel alone never sets ``expired``.
+
+    ``_armed`` guards the window between a queued ``_fire`` and
+    ``remove_done_callback``: callbacks already scheduled via ``call_soon``
+    cannot be removed, so a fire after ``__aexit__`` must no-op instead of
+    cancelling the task inside its post-scope cleanup.
+
+    With ``source`` set, ``__aiter__`` scopes the cancel to its own ``async
+    for`` on the source; a cancel landing in the caller's loop body is not
+    ours to swallow. ``async with`` around the source loop covers the body.
+    """
 
     c: Context
     source: AsyncIterable[T] | None = None
-    watcher: asyncio.Task[None] | None = None
-    cancelled_current_task: bool = False
+    expired: bool = False
+    _task: asyncio.Task[Any] | None = None
+    _futures: tuple[asyncio.Future[None], ...] = ()
+    _armed: bool = False
+    _cancelling: int = 0
 
     async def __aiter__(self) -> AsyncIterator[T]:
         if self.source is None:
@@ -109,21 +158,30 @@ class _Alive[T]:
             async for item in self.source:
                 yield item
 
+    def _fire(self, _fut: asyncio.Future[None]) -> None:
+        """One-shot: the first completion wins and disarms the rest."""
+        if not self._armed:
+            return
+        self._armed = False
+        for fut in self._futures:
+            fut.remove_done_callback(self._fire)
+        task = self._task
+        if (
+            task is not None
+            and not task.done()
+            and task.cancelling() == self._cancelling
+        ):
+            self.expired = True
+            task.cancel()
+
     async def __aenter__(self) -> _Alive[T]:
-        current_task = asyncio.current_task()
-        disconnect = self.c.disconnect
-        shutdown = self.c.app.shutdown
-
-        async def watcher() -> None:
-            await asyncio.wait(
-                {disconnect, shutdown},
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            if current_task and not current_task.done():
-                self.cancelled_current_task = True
-                current_task.cancel()
-
-        self.watcher = asyncio.create_task(watcher(), name="stario.context.alive")
+        self._task = asyncio.current_task()
+        self._futures = (self.c.disconnect, self.c.app.shutdown)
+        if self._task is not None:
+            self._cancelling = self._task.cancelling()
+        self._armed = True
+        for fut in self._futures:
+            fut.add_done_callback(self._fire)
         return self
 
     async def __aexit__(
@@ -132,18 +190,21 @@ class _Alive[T]:
         exc_val: BaseException | None,
         exc_tb: object | None,
     ) -> bool:
-        if self.watcher:
-            self.watcher.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self.watcher
+        self._armed = False
+        for fut in self._futures:
+            fut.remove_done_callback(self._fire)
 
-        return (
-            exc_type is not None
-            and issubclass(exc_type, asyncio.CancelledError)
-            and self.cancelled_current_task
-        )
+        if (
+            exc_type is None
+            or not issubclass(exc_type, asyncio.CancelledError)
+            or not self.expired
+        ):
+            return False
+        # Swallow only our own cancel: after uncancel(), anything left in the
+        # count is a request somebody else made — it must propagate.
+        task = asyncio.current_task()
+        return task is not None and task.uncancel() <= self._cancelling
 
 
-type Handler = Callable[[Context, Writer], Awaitable[None]]
-
+type Handler = Callable[[Context, "Writer"], Awaitable[None]]
 type Middleware = Callable[[Handler], Handler]

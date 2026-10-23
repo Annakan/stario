@@ -1,5 +1,7 @@
 """Persists finished spans to SQLite for local querying — not a distributed trace store."""
 
+from __future__ import annotations
+
 import sqlite3
 import time
 from pathlib import Path
@@ -33,6 +35,8 @@ _SCHEMA_SQL = """
 
     CREATE INDEX IF NOT EXISTS spans_trace_id_idx
         ON spans (trace_id);
+    CREATE INDEX IF NOT EXISTS spans_end_ns_idx
+        ON spans (end_ns);
     CREATE INDEX IF NOT EXISTS spans_error_end_ns_idx
         ON spans (end_ns)
         WHERE status = 'error';

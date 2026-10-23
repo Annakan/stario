@@ -1,55 +1,22 @@
 """Tests for Datastar signal parsing via `stario.datastar.read_signals`."""
 
-from urllib.parse import urlencode
-
 import pytest
 
 from stario.datastar import read_signals
-from stario.exceptions import StarioError
-from stario.http.headers import Headers
-from stario.http.request import BodyReader, Request
-
-
-def _make_request(
-    *,
-    method: str = "GET",
-    path: str = "/",
-    headers: dict[str, str] | None = None,
-    body: bytes = b"",
-    query: dict[str, object] | None = None,
-) -> Request:
-    hdrs = Headers()
-    if headers:
-        for name, value in headers.items():
-            hdrs.set(name, value)
-
-    reader = BodyReader(
-        pause=lambda: None,
-        resume=lambda: None,
-        disconnect=None,
-    )
-    reader._cached = body
-    reader._complete = True
-
-    return Request(
-        method=method,
-        path=path,
-        query_bytes=urlencode(query or {}, doseq=True).encode("ascii"),
-        headers=hdrs,
-        body=reader,
-    )
+from stario.exceptions import RequestBodyError
+from tests.helpers import make_request
 
 
 class TestReadSignals:
     async def test_returns_dict_for_valid_post_body(self):
-        req = _make_request(method="POST", body=b'{"name":"test","count":42}')
+        req = make_request(method="POST", body=b'{"name":"test","count":42}')
 
         result = await read_signals(req)
 
         assert result == {"name": "test", "count": 42}
 
     async def test_reads_get_query_datastar_payload(self):
-        req = _make_request(
+        req = make_request(
             method="GET", query={"datastar": '{"name":"test","count":42}'}
         )
 
@@ -58,7 +25,7 @@ class TestReadSignals:
         assert result == {"name": "test", "count": 42}
 
     async def test_delete_ignores_body_uses_query(self):
-        req = _make_request(
+        req = make_request(
             method="DELETE",
             query={"datastar": '{"from":"query"}'},
             body=b'{"from":"body"}',
@@ -69,28 +36,39 @@ class TestReadSignals:
         assert result == {"from": "query"}
 
     async def test_missing_payload_defaults_to_empty_dict(self):
-        req = _make_request(method="GET")
+        req = make_request(method="GET")
 
         result = await read_signals(req)
 
         assert result == {}
 
-    async def test_invalid_json_raises_stario_error(self):
-        req = _make_request(method="POST", body=b"{invalid")
+    async def test_invalid_json_raises_body_error_400(self):
+        req = make_request(method="POST", body=b"{invalid")
 
-        with pytest.raises(StarioError, match="valid JSON"):
+        with pytest.raises(RequestBodyError, match="Invalid Datastar signals") as info:
             await read_signals(req)
+        assert info.value.status_code == 400
+        assert isinstance(info.value.__cause__, ValueError)
 
     @pytest.mark.parametrize("payload", [b"[1,2,3]", b"null", b'"text"', b"42"])
-    async def test_non_object_json_raises_stario_error(self, payload: bytes):
-        req = _make_request(method="POST", body=payload)
+    async def test_non_object_json_raises_body_error_400(self, payload: bytes):
+        req = make_request(method="POST", body=payload)
 
-        with pytest.raises(StarioError, match="Signals must decode to a JSON object"):
+        with pytest.raises(RequestBodyError, match="Invalid Datastar signals") as info:
+            await read_signals(req)
+        assert info.value.status_code == 400
+
+    async def test_deep_nesting_raises_body_error_400(self):
+        # Past the decoder's depth cap stdlib json raises RecursionError, not
+        # ValueError; it must still map to a 400, not a 500.
+        req = make_request(method="POST", body=b"[" * 100_000 + b"]" * 100_000)
+
+        with pytest.raises(RequestBodyError, match="Invalid Datastar signals"):
             await read_signals(req)
 
-    @pytest.mark.parametrize("method", ["POST", "PUT", "PATCH"])
+    @pytest.mark.parametrize("method", ["POST", "PUT", "PATCH", "QUERY"])
     async def test_write_methods_use_body_not_query(self, method: str):
-        req = _make_request(
+        req = make_request(
             method=method,
             query={"datastar": '{"from":"query"}'},
             body=b'{"from":"body"}',

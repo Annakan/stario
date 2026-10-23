@@ -5,7 +5,6 @@ The lobby is UI over the room domain: it imports queries from
 `app.features.room.data` instead of owning tables of its own.
 """
 
-import stario.responses as responses
 from app.common.identity import VisitorIdentity, identity_for_page, resolve_identity
 from app.db import Database
 from app.features.room import data as room_data
@@ -16,7 +15,7 @@ from stario.datastar import SSE
 
 from . import subjects as lobby_subjects
 from .signals import read_lobby_signals
-from .urls import LOBBY, SUBSCRIBE
+from .urls import LIVE, LOBBY
 from .views import LOBBY_LIVE_SELECTOR, lobby_live_view, lobby_view
 
 MAX_TITLE_LENGTH = 60
@@ -48,28 +47,28 @@ def show_lobby(db: Database):
         )
         rooms = room_data.list_rooms(db)
         online = room_data.count_users_by_room(db)
-        responses.html(
-            w,
+        w.html(
             lobby_view(rooms=rooms, online_counts=online, identity=identity),
         )
 
     return handler
 
 
-def subscribe(db: Database, relay: Relay[str]):
-    """GET /subscribe — SSE patches when rooms or presence change."""
+def live(db: Database, relay: Relay[str]):
+    """GET /live — SSE patches when rooms or presence change."""
 
     async def handler(c: Context, w: Writer) -> None:
         identity = await resolve_identity(c)
         if identity is None:
-            responses.redirect(w, LOBBY.href())
+            # Reload the lobby page, which mints a fresh identity.
+            SSE(w).navigate(LOBBY.href())
             return
 
-        async with relay.subscribe("room.*", "lobby.*") as live:
+        async with relay.subscribe("room.*", "lobby.*") as events:
             sse = SSE(w)
             patch_lobby(sse, db, identity)
 
-            async for subject, _ in c.alive(live):
+            async for subject, _ in c.alive(events):
                 c.span.event("relay", {"subject": subject})
                 if subject.startswith("lobby.") or any(
                     subject.endswith(s) for s in _LOBBY_REFRESH_SUFFIXES
@@ -86,7 +85,7 @@ def create_room(db: Database, relay: Relay[str]):
         signals = await read_lobby_signals(c)
         title = signals.room_title.strip()[:MAX_TITLE_LENGTH]
         if not title:
-            responses.redirect(w, LOBBY.href(), 303)
+            w.empty()
             return
 
         description = (signals.room_description.strip() or title)[
@@ -95,7 +94,7 @@ def create_room(db: Database, relay: Relay[str]):
         room = room_data.add_room(db, title=title, description=description)
         c.span.event("Room created", {"room_id": room.id, "title": room.title})
         relay.publish(lobby_subjects.rooms(), "created")
-        responses.redirect(w, ROOM.href(room_id=room.id), 303)
+        SSE(w).navigate(ROOM.href(room_id=room.id))
 
     return handler
 
@@ -108,18 +107,18 @@ def delete_room(db: Database, relay: Relay[str]):
     """
 
     async def handler(c: Context, w: Writer) -> None:
-        room_id = c.route.params.get("room_id", "")
+        room_id = c.match.params.get("room_id", "")
         if room_data.delete_room(db, room_id):
             c.span.event("Room deleted", {"room_id": room_id})
             relay.publish(room_subjects.deleted(room_id), "deleted")
             relay.publish(lobby_subjects.rooms(), "deleted")
-        responses.redirect(w, LOBBY.href(), 303)
+        w.empty()
 
     return handler
 
 
 def register_lobby(app: App, db: Database, relay: Relay[str]) -> None:
     app.add(LOBBY, show_lobby(db))
-    app.add(SUBSCRIBE, subscribe(db, relay))
+    app.add(LIVE, live(db, relay))
     app.add(CREATE, create_room(db, relay))
     app.add(DELETE, delete_room(db, relay))

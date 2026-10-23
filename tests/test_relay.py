@@ -16,15 +16,17 @@ async def _collect_one(
     """Start a single-shot subscriber; publish once; wait until it receives or times out."""
     received: list[tuple[str, object]] = []
     done = asyncio.Event()
+    ready = asyncio.Event()
 
     async def subscriber() -> None:
         async with relay.subscribe(pattern) as sub:
+            ready.set()
             s, d = await sub.receive()
             received.append((s, d))
             done.set()
 
     task = asyncio.create_task(subscriber())
-    await asyncio.sleep(0.01)
+    await ready.wait()
     relay.publish(subject, data)
     await asyncio.wait_for(done.wait(), timeout=1.0)
     await task
@@ -77,15 +79,18 @@ class TestRelayBasic:
         relay = Relay()
         received: list[tuple[str, dict[str, int]]] = []
 
+        ready = asyncio.Event()
+
         async def subscriber() -> None:
             async with relay.subscribe("test.*") as sub:
+                ready.set()
                 async for subject, data in sub:
                     received.append((subject, data))
                     if len(received) >= 2:
                         break
 
         task = asyncio.create_task(subscriber())
-        await asyncio.sleep(0.01)
+        await ready.wait()
         relay.publish("test.one", {"msg": 1})
         relay.publish("test.two", {"msg": 2})
         await asyncio.wait_for(task, timeout=1.0)
@@ -108,18 +113,108 @@ class TestRelayBasic:
         assert received == [1, 2]
 
 
+class TestRelayBoundedInbox:
+    def test_maxsize_must_be_at_least_one(self) -> None:
+        relay = Relay()
+        with pytest.raises(StarioError, match="at least 1"):
+            relay.subscribe("n", maxsize=0)
+
+    async def test_maxsize_keeps_newest_in_order(self) -> None:
+        relay = Relay[int]()
+        async with relay.subscribe("n", maxsize=3) as sub:
+            for i in range(5):
+                relay.publish("n", i)
+            received = [await sub.receive() for _ in range(3)]
+            assert received == [("n", 2), ("n", 3), ("n", 4)]
+            assert sub.dropped == 2
+
+    async def test_maxsize_still_hands_off_to_blocked_receive(self) -> None:
+        relay = Relay[int]()
+        async with relay.subscribe("n", maxsize=1) as sub:
+            waiter = asyncio.ensure_future(sub.receive())
+            await asyncio.sleep(0)
+            relay.publish("n", 1)
+            relay.publish("n", 2)
+            assert (await waiter) == ("n", 1)
+            # The second publish buffered; the first was already handed off.
+            assert await sub.receive() == ("n", 2)
+            assert sub.dropped == 0
+
+    async def test_latest_keeps_newest_per_subject(self) -> None:
+        relay = Relay[int]()
+        async with relay.subscribe("room.*", latest=True) as sub:
+            relay.publish("room.1", 1)
+            relay.publish("room.1", 2)
+            relay.publish("room.2", 3)
+            relay.publish("room.1", 4)
+            assert sub.dropped == 2  # two stale room.1 values replaced
+            # room.2 arrived before the last room.1 replacement moved to end.
+            assert await sub.receive() == ("room.2", 3)
+            assert await sub.receive() == ("room.1", 4)
+
+    async def test_latest_with_maxsize_caps_distinct_subjects(self) -> None:
+        relay = Relay[int]()
+        async with relay.subscribe("room.*", maxsize=2, latest=True) as sub:
+            relay.publish("room.1", 1)
+            relay.publish("room.2", 2)
+            relay.publish("room.3", 3)
+            assert sub.dropped == 1  # room.1 evicted, not replaced
+            assert await sub.receive() == ("room.2", 2)
+            assert await sub.receive() == ("room.3", 3)
+            # A re-publish of a dropped subject is a fresh buffer entry.
+            relay.publish("room.1", 4)
+            assert sub.dropped == 1
+            assert await sub.receive() == ("room.1", 4)
+
+    async def test_latest_hand_off_to_blocked_receive(self) -> None:
+        relay = Relay[int]()
+        async with relay.subscribe("n", latest=True) as sub:
+            waiter = asyncio.ensure_future(sub.receive())
+            await asyncio.sleep(0)
+            relay.publish("n", 9)
+            assert (await waiter) == ("n", 9)
+            assert sub.dropped == 0
+
+    async def test_maxsize_applies_to_cross_thread_enqueue(self) -> None:
+        relay = Relay[int]()
+
+        async with relay.subscribe("n", maxsize=3) as sub:
+            thread = threading.Thread(
+                target=lambda: [relay.publish("n", i) for i in range(8)]
+            )
+            thread.start()
+            thread.join(timeout=1.0)
+            assert sub.dropped == 5
+            received = [await sub.receive() for _ in range(3)]
+            assert received == [("n", 5), ("n", 6), ("n", 7)]
+
+    async def test_latest_applies_to_cross_thread_enqueue(self) -> None:
+        relay = Relay[int]()
+        async with relay.subscribe("n", latest=True) as sub:
+            thread = threading.Thread(
+                target=lambda: [relay.publish("n", i) for i in range(8)]
+            )
+            thread.start()
+            thread.join(timeout=1.0)
+            assert sub.dropped == 7
+            assert await sub.receive() == ("n", 7)
+
+
 class TestRelayPatterns:
     async def test_exact_match(self) -> None:
         relay = Relay()
         received: list[str] = []
 
+        ready = asyncio.Event()
+
         async def subscriber() -> None:
             async with relay.subscribe("exact.match") as sub:
+                ready.set()
                 subject, _data = await sub.receive()
                 received.append(subject)
 
         task = asyncio.create_task(subscriber())
-        await asyncio.sleep(0.01)
+        await ready.wait()
         relay.publish("exact.match", None)
         relay.publish("exact.other", None)
         await asyncio.wait_for(task, timeout=1.0)
@@ -130,15 +225,18 @@ class TestRelayPatterns:
         relay = Relay()
         received: list[str] = []
 
+        ready = asyncio.Event()
+
         async def subscriber() -> None:
             async with relay.subscribe("room.123.*") as sub:
+                ready.set()
                 async for subject, _data in sub:
                     received.append(subject)
                     if len(received) >= 3:
                         break
 
         task = asyncio.create_task(subscriber())
-        await asyncio.sleep(0.01)
+        await ready.wait()
         relay.publish("room.123.moves", None)
         relay.publish("room.123.chat", None)
         relay.publish("room.123.leave", None)
@@ -151,15 +249,18 @@ class TestRelayPatterns:
         relay = Relay()
         received: list[str] = []
 
+        ready = asyncio.Event()
+
         async def subscriber() -> None:
             async with relay.subscribe("*") as sub:
+                ready.set()
                 async for subject, _data in sub:
                     received.append(subject)
                     if len(received) >= 2:
                         break
 
         task = asyncio.create_task(subscriber())
-        await asyncio.sleep(0.01)
+        await ready.wait()
         relay.publish("anything.here", None)
         relay.publish("something.else", None)
         await asyncio.wait_for(task, timeout=1.0)
@@ -172,15 +273,18 @@ class TestRelaySubscribeMultiplePatterns:
         relay = Relay()
         received: list[tuple[str, int]] = []
 
+        ready = asyncio.Event()
+
         async def subscriber() -> None:
             async with relay.subscribe("*", "users.*") as sub:
+                ready.set()
                 async for subject, data in sub:
                     received.append((subject, data))
                     if len(received) >= 2:
                         break
 
         task = asyncio.create_task(subscriber())
-        await asyncio.sleep(0.01)
+        await ready.wait()
         relay.publish("users.a.b", 1)
         relay.publish("other.x", 2)
         await asyncio.wait_for(task, timeout=1.0)
@@ -190,13 +294,16 @@ class TestRelaySubscribeMultiplePatterns:
         relay = Relay()
         received: list[tuple[str, int]] = []
 
+        ready = asyncio.Event()
+
         async def subscriber() -> None:
             async with relay.subscribe("users.*", "users.alice") as sub:
+                ready.set()
                 subject, data = await sub.receive()
                 received.append((subject, data))
 
         task = asyncio.create_task(subscriber())
-        await asyncio.sleep(0.01)
+        await ready.wait()
         relay.publish("users.alice", 1)
         await asyncio.wait_for(task, timeout=1.0)
         assert received == [("users.alice", 1)]
@@ -205,19 +312,22 @@ class TestRelaySubscribeMultiplePatterns:
         relay = Relay[int]()
         received: list[tuple[str, int]] = []
 
+        ready = asyncio.Event()
+
         async def subscriber() -> None:
             async with relay.subscribe(
                 "users.alice.message",
                 "users.alice.*",
                 "users.*",
             ) as sub:
+                ready.set()
                 async for msg in sub:
                     received.append(msg)
                     if len(received) >= 2:
                         break
 
         task = asyncio.create_task(subscriber())
-        await asyncio.sleep(0.01)
+        await ready.wait()
         relay.publish("users.alice.message", 1)
         relay.publish("users.bob.message", 2)
         await asyncio.wait_for(task, timeout=1.0)
@@ -228,15 +338,18 @@ class TestRelaySubscribeMultiplePatterns:
         relay = Relay[int]()
         received: list[tuple[str, int]] = []
 
+        ready = asyncio.Event()
+
         async def subscriber() -> None:
             async with relay.subscribe("users.alice", "users.alice.*") as sub:
+                ready.set()
                 async for msg in sub:
                     received.append(msg)
                     if len(received) >= 2:
                         break
 
         task = asyncio.create_task(subscriber())
-        await asyncio.sleep(0.01)
+        await ready.wait()
         relay.publish("users.alice", 1)
         relay.publish("users.alice.message", 2)
         await asyncio.wait_for(task, timeout=1.0)
@@ -247,15 +360,18 @@ class TestRelaySubscribeMultiplePatterns:
         relay = Relay()
         received: list[tuple[str, int]] = []
 
+        ready = asyncio.Event()
+
         async def subscriber() -> None:
             async with relay.subscribe("users.a", "users.b") as sub:
+                ready.set()
                 async for subject, data in sub:
                     received.append((subject, data))
                     if len(received) >= 2:
                         break
 
         task = asyncio.create_task(subscriber())
-        await asyncio.sleep(0.01)
+        await ready.wait()
         relay.publish("users.a", 1)
         relay.publish("users.b", 2)
         await asyncio.wait_for(task, timeout=1.0)
@@ -287,14 +403,16 @@ class TestRelayCleanup:
 
     async def test_unsubscribe_after_finite_async_with(self) -> None:
         relay = Relay()
+        ready = asyncio.Event()
 
         async def first() -> None:
             async with relay.subscribe("cleanup.test") as sub:
+                ready.set()
                 async for _ in sub:
                     break
 
         task = asyncio.create_task(first())
-        await asyncio.sleep(0.01)
+        await ready.wait()
         relay.publish("cleanup.test", None)
         await asyncio.wait_for(task, timeout=1.0)
 
@@ -319,19 +437,25 @@ class TestRelayMultipleSubscribers:
         received1: list[str] = []
         received2: list[str] = []
 
+        ready1 = asyncio.Event()
+        ready2 = asyncio.Event()
+
         async def sub1() -> None:
             async with relay.subscribe("shared.*") as sub:
+                ready1.set()
                 subject, _data = await sub.receive()
                 received1.append(subject)
 
         async def sub2() -> None:
             async with relay.subscribe("shared.*") as sub:
+                ready2.set()
                 subject, _data = await sub.receive()
                 received2.append(subject)
 
         task1 = asyncio.create_task(sub1())
         task2 = asyncio.create_task(sub2())
-        await asyncio.sleep(0.01)
+        await ready1.wait()
+        await ready2.wait()
         relay.publish("shared.message", None)
         await asyncio.wait_for(asyncio.gather(task1, task2), timeout=1.0)
 
@@ -344,11 +468,13 @@ class TestRelayRaceConditions:
         relay = Relay()
         unsubscribed = 0
         cleanup_events = [asyncio.Event() for _ in range(5)]
+        ready = [asyncio.Event() for _ in range(5)]
 
         async def quick_subscriber(idx: int) -> None:
             nonlocal unsubscribed
             try:
                 async with relay.subscribe("concurrent.*") as sub:
+                    ready[idx].set()
                     await sub.receive()
             finally:
                 await asyncio.sleep(0)
@@ -356,7 +482,7 @@ class TestRelayRaceConditions:
                 cleanup_events[idx].set()
 
         tasks = [asyncio.create_task(quick_subscriber(i)) for i in range(5)]
-        await asyncio.sleep(0.01)
+        await asyncio.gather(*[e.wait() for e in ready])
         relay.publish("concurrent.msg", None)
         await asyncio.wait_for(asyncio.gather(*tasks), timeout=1.0)
         await asyncio.wait_for(
@@ -372,16 +498,19 @@ class TestRelaySubscriptionOrdering:
         relay = Relay[str]()
         received: list[str] = []
 
+        ready = asyncio.Event()
+
         async def subscriber() -> None:
             async with relay.subscribe("room.*") as sub:
                 relay.publish("room.a", "during-setup")
+                ready.set()
                 async for _subject, data in sub:
                     received.append(data)
                     if len(received) >= 2:
                         break
 
         task = asyncio.create_task(subscriber())
-        await asyncio.sleep(0.01)
+        await ready.wait()
         relay.publish("room.b", "after-loop-start")
         await asyncio.wait_for(task, timeout=1.0)
 
@@ -393,14 +522,17 @@ class TestRelayThreadSafety:
         relay = Relay[dict[str, int]]()
         received: list[tuple[str, dict[str, int]]] = []
 
+        ready = asyncio.Event()
+
         async def subscriber() -> None:
             async with relay.subscribe("room.*") as sub:
+                ready.set()
                 async for subject, data in sub:
                     received.append((subject, data))
                     break
 
         task = asyncio.create_task(subscriber())
-        await asyncio.sleep(0.01)
+        await ready.wait()
 
         thread = threading.Thread(
             target=lambda: relay.publish("room.1", {"x": 1}),
@@ -410,6 +542,46 @@ class TestRelayThreadSafety:
 
         await asyncio.wait_for(task, timeout=1.0)
         assert received == [("room.1", {"x": 1})]
+
+    async def test_worker_thread_burst_is_ordered_and_coalesces_wakes(self) -> None:
+        """1000 cross-thread publishes arrive in order with far fewer loop hops."""
+        relay = Relay[int]()
+        loop = asyncio.get_running_loop()
+        hops = 0
+        real = loop.call_soon_threadsafe
+
+        def counting(callback, *args, **kwargs):
+            nonlocal hops
+            hops += 1
+            return real(callback, *args, **kwargs)
+
+        loop.call_soon_threadsafe = counting  # type: ignore[method-assign]
+        ready = asyncio.Event()
+        received: list[int] = []
+        count = 1000
+        try:
+
+            async def subscriber() -> None:
+                async with relay.subscribe("n") as sub:
+                    ready.set()
+                    async for _subject, value in sub:
+                        received.append(value)
+                        if len(received) == count:
+                            return
+
+            task = asyncio.create_task(subscriber())
+            await ready.wait()
+            thread = threading.Thread(
+                target=lambda: [relay.publish("n", i) for i in range(count)]
+            )
+            thread.start()
+            await asyncio.wait_for(task, timeout=5.0)
+            thread.join(timeout=1.0)
+        finally:
+            del loop.call_soon_threadsafe
+        assert received == list(range(count))
+        # One hop per burst while receive() is blocked, none while it keeps up.
+        assert hops < count // 2
 
     async def test_publish_fans_out_to_subscribers_on_multiple_loops(self) -> None:
         relay = Relay[str]()
@@ -505,13 +677,15 @@ class TestRelayFailureModes:
         def run_and_abandon() -> None:
             other_loop = asyncio.new_event_loop()
             asyncio.set_event_loop(other_loop)
+            entered = other_loop.create_future()
 
             async def register_only() -> None:
                 async with relay.subscribe("zombie.topic"):
+                    entered.set_result(None)
                     await asyncio.Event().wait()
 
             task = other_loop.create_task(register_only())
-            other_loop.run_until_complete(asyncio.sleep(0.05))
+            other_loop.run_until_complete(entered)
             task.cancel()
             other_loop.close()
 

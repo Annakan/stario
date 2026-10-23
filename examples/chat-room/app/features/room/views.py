@@ -5,13 +5,13 @@ import time
 from app.common.identity import VISITOR_SESSION_INIT
 from app.common.shell import page
 from app.features.lobby.urls import LOBBY
+from stario import h
 from stario.datastar import at, data
 from stario.debug import debug_inspector
 from stario.markup import HtmlElement, SafeString, classes, styles
-from stario.markup import html as h
 
 from .models import Message, Room, User
-from .urls import SEND, SUBSCRIBE, TYPING
+from .urls import LIVE, SEND, TYPING
 
 
 def message_view(msg: Message, current_user_id: str) -> HtmlElement:
@@ -106,10 +106,14 @@ def online_users_view(users: list[User]) -> HtmlElement:
 
 
 def input_form_view(room_id: str) -> HtmlElement:
-    send = at.fetch(SEND, {"room_id": room_id})
+    send = at.post(SEND.href(room_id))
     return h.Form(
         {"id": "input-form", "class": "input-form"},
-        data.on("submit", "evt.preventDefault()"),
+        data.on(
+            "submit",
+            f"if ($message.trim()) {{ {send}; $message = ''; }}",
+            prevent=True,
+        ),
         h.Input(
             {
                 "id": "message-input",
@@ -120,17 +124,7 @@ def input_form_view(room_id: str) -> HtmlElement:
                 "autofocus": True,
             },
             data.bind("message"),
-            data.on(
-                "keydown",
-                f"""
-                if (evt.key === 'Enter' && !evt.shiftKey && $message.trim()) {{
-                    evt.preventDefault();
-                    {send};
-                    $message = '';
-                }}
-                """,
-            ),
-            data.on("input", at.fetch(TYPING, {"room_id": room_id})),
+            data.on("input", at.post(TYPING.href(room_id))),
         ),
         h.Button(
             {"type": "button", "class": "send-button"},
@@ -210,9 +204,7 @@ def room_view(
                     },
                     if_missing=True,
                 ),
-                data.init(
-                    f"{VISITOR_SESSION_INIT}\n{at.fetch(SUBSCRIBE, {'room_id': room.id})}"
-                ),
+                data.init(f"{VISITOR_SESSION_INIT}\n{at.get(LIVE.href(room.id))}"),
                 room_live_view(
                     room,
                     user_id,

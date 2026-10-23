@@ -14,11 +14,14 @@
 **Threading**: `Relay.lock` protects the subscriber registry. Each subscription
 has an `_inbox_lock` guarding its pending queue and waiter future so a worker
 thread can `publish` while a handler awaits the next message on the owning loop.
-Cross-loop delivery always uses `loop.call_soon_threadsafe`.
+A cross-loop publish appends under that lock and schedules one
+`loop.call_soon_threadsafe` wake per burst, only while a `receive()` is blocked.
 
 `RelaySubscription` is an opaque handle — enter with `async with`, then
 consume with `receive()` or `async for`.
 """
+
+from __future__ import annotations
 
 from asyncio import AbstractEventLoop, Future, get_running_loop
 from collections import deque
@@ -26,12 +29,12 @@ from collections.abc import AsyncIterator
 from functools import lru_cache
 from threading import Lock
 from types import TracebackType
-from typing import Any, Self
+from typing import Self, cast
 
 from stario.exceptions import StarioError, StarioRuntime
 
 # Message: (subject, data)
-type Msg[T = Any] = tuple[str, T]
+type Msg[T] = tuple[str, T]
 
 
 def _pattern_covers(broad: str, narrow: str) -> bool:
@@ -106,15 +109,19 @@ def _deduplicate_patterns(patterns: tuple[str, ...]) -> tuple[str, ...]:
     return tuple(kept)
 
 
-class RelaySubscription[T = Any]:
+class RelaySubscription[T]:
     """Opaque `Relay.subscribe` handle — enter before receiving messages."""
 
     __slots__ = (
         "_inbox_lock",
         "_items",
+        "_latest",
+        "_maxsize",
         "_relay",
         "_waiter",
+        "_wake_pending",
         "active",
+        "dropped",
         "generation",
         "loop",
         "patterns",
@@ -124,21 +131,31 @@ class RelaySubscription[T = Any]:
         self,
         relay: Relay[T],
         patterns: tuple[str, ...],
+        *,
+        maxsize: int | None = None,
+        latest: bool = False,
     ) -> None:
         self._relay = relay
         self.patterns = patterns
+        self._maxsize = maxsize
+        self._latest = latest
+        # Messages lost to bounded/latest inbox policy since registration.
+        self.dropped = 0
         # Guards the inbox below so a worker-thread publish can hand a message to a
         # handler awaiting on the owning loop.
         self._inbox_lock = Lock()
         self.active = False
         # Bumped on register/unregister so in-flight deliveries after teardown are ignored.
         self.generation = 0
-        # Messages delivered while no receive() is waiting. Unbounded by design.
-        self._items: deque[Msg[T]] = deque()
+        # Messages delivered while no receive() is waiting. A deque in normal
+        # mode; a subject-keyed dict in latest mode (insertion order = arrival).
+        self._items: deque[Msg[T]] | dict[str, Msg[T]] = {} if latest else deque()
         # The loop that registered us; every delivery must land there.
         self.loop: AbstractEventLoop | None = None
         # The future a blocked receive() is awaiting, if any (at most one).
         self._waiter: Future[Msg[T]] | None = None
+        # A cross-loop enqueue() already scheduled wake() on the owning loop.
+        self._wake_pending = False
 
     def _register(self) -> None:
         loop = get_running_loop()
@@ -150,6 +167,7 @@ class RelaySubscription[T = Any]:
             self._items.clear()
             self.loop = loop
             self._waiter = None
+            self._wake_pending = False
         # Join the registry while still inactive; publish skips until active is set.
         with self._relay.lock:
             for pat in self.patterns:
@@ -189,7 +207,7 @@ class RelaySubscription[T = Any]:
                 )
             # Drain buffered messages first; only block when the inbox is empty.
             if self._items:
-                return self._items.popleft()
+                return self._popleft_locked()
             # Single-consumer handle: a second concurrent receive() is a usage bug.
             if self._waiter is not None:
                 raise StarioRuntime("subscription already has a pending receive")
@@ -204,23 +222,80 @@ class RelaySubscription[T = Any]:
                 if self._waiter is waiter:
                     self._waiter = None
 
+    def _append_locked(self, msg: Msg[T]) -> None:
+        # Inbox policy lives here so deliver() and enqueue() share it.
+        items = self._items
+        if self._latest:
+            latest_items = cast(dict[str, Msg[T]], items)
+            subject = msg[0]
+            if subject in latest_items:
+                # Newer value for a buffered subject replaces it, latest at end.
+                del latest_items[subject]
+                self.dropped += 1
+            elif self._maxsize is not None and len(latest_items) >= self._maxsize:
+                del latest_items[next(iter(latest_items))]
+                self.dropped += 1
+            latest_items[subject] = msg
+            return
+        queue = cast(deque[Msg[T]], items)
+        if self._maxsize is not None and len(queue) >= self._maxsize:
+            queue.popleft()
+            self.dropped += 1
+        queue.append(msg)
+
+    def _popleft_locked(self) -> Msg[T]:
+        items = self._items
+        if self._latest:
+            latest_items = cast(dict[str, Msg[T]], items)
+            return latest_items.pop(next(iter(latest_items)))
+        return cast(deque[Msg[T]], items).popleft()
+
     def deliver(self, msg: Msg[T], generation: int) -> None:
-        # Always runs on the subscription's own loop — inline for same-loop
-        # publishers, or via call_soon_threadsafe for cross-loop ones — so it never
-        # races a receive() or cancel happening on that loop.
+        # Runs on the subscription's own loop (same-loop publishers call it
+        # inline), so it may complete the waiter Future directly.
         with self._inbox_lock:
             # Stale delivery for a torn-down / re-registered subscription: drop it.
             if not self.active or self.generation != generation:
                 return
-            waiter = self._waiter
-            if waiter is not None:
-                self._waiter = None
-                # Hand straight to the blocked receive(); if it was already cancelled
-                # (done) fall through and buffer the message instead.
-                if not waiter.done():
-                    waiter.set_result(msg)
-                    return
-            self._items.append(msg)
+            self._append_locked(msg)
+            self._hand_off_locked()
+
+    def enqueue(self, msg: Msg[T], generation: int) -> bool:
+        """Buffer ``msg`` from any thread. True when the owning loop needs a wake.
+
+        Only the Future hand-off is loop-affine; the deque is not. A
+        cross-loop publisher appends under the inbox lock and hops to the
+        loop only when a ``receive()`` is blocked and no hop is already in
+        flight. A subscriber that keeps up costs its publisher no
+        ``call_soon_threadsafe`` at all; a burst of N messages costs one.
+        """
+        with self._inbox_lock:
+            if not self.active or self.generation != generation:
+                return False
+            self._append_locked(msg)
+            if self._waiter is None or self._wake_pending:
+                return False
+            self._wake_pending = True
+            return True
+
+    def wake(self, generation: int) -> None:
+        """Hand buffered messages to a blocked receive(); scheduled by a cross-loop enqueue()."""
+        with self._inbox_lock:
+            self._wake_pending = False
+            if not self.active or self.generation != generation:
+                return
+            self._hand_off_locked()
+
+    def _hand_off_locked(self) -> None:
+        # Caller holds _inbox_lock and runs on the owning loop. Give the
+        # oldest buffered message to a blocked receive(); a cancelled (done)
+        # waiter leaves the message buffered for the next receive().
+        waiter = self._waiter
+        if waiter is None or not self._items:
+            return
+        self._waiter = None
+        if not waiter.done():
+            waiter.set_result(self._popleft_locked())
 
     async def __aenter__(self) -> Self:
         # Register on enter; unregister on exit — otherwise handles stay in
@@ -248,7 +323,7 @@ class RelaySubscription[T = Any]:
             yield await self.receive()
 
 
-class Relay[T = Any]:
+class Relay[T]:
     """In-process publish/subscribe registry.
 
     Use `async with relay.subscribe(...) as sub:`, then consume with
@@ -349,20 +424,17 @@ class Relay[T = Any]:
         for subscription in dead:
             self.drop_subscription(subscription)
 
-        # Cross-loop subscribers: hop onto each owning loop to deliver safely.
+        # Cross-loop subscribers: buffer here, hop onto the owning loop only
+        # when a blocked receive() needs waking (one hop per burst, not per
+        # message).
         for subscription, generation, loop in deferred:
-            # Re-check the snapshot: the sub may have torn down since we sampled it.
-            if not subscription.active or subscription.generation != generation:
-                continue
             if loop.is_closed():
                 self.drop_subscription(subscription)
                 continue
+            if not subscription.enqueue(msg, generation):
+                continue
             try:
-                loop.call_soon_threadsafe(
-                    subscription.deliver,
-                    msg,
-                    generation,
-                )
+                loop.call_soon_threadsafe(subscription.wake, generation)
             except RuntimeError:
                 # Lost a race with loop shutdown; only swallow the closed-loop case.
                 if not loop.is_closed():
@@ -372,23 +444,41 @@ class Relay[T = Any]:
     def subscribe(
         self,
         *patterns: str,
+        maxsize: int | None = None,
+        latest: bool = False,
     ) -> RelaySubscription[T]:
         """Subscribe to one or more patterns.
 
         Overlapping patterns are merged — each matching publish delivers at most once.
 
         The returned handle buffers nothing until entered with `async with`; do not
-        use `async for` on the bare return value. Its inbox is unbounded: a consumer
-        that falls behind a fast publisher grows memory without limit. Use a broker
-        (NATS, Redis) when you need backpressure.
+        use `async for` on the bare return value. Its inbox is unbounded by
+        default: a consumer that falls behind a fast publisher grows memory
+        without limit. Two opt-in bounds change that:
+
+        - `maxsize=N` caps buffered messages; when full, the oldest buffered
+          message is dropped for the new one.
+        - `latest=True` keeps only the newest message per subject; a new
+          message for a buffered subject replaces it (and moves it to the
+          end). With `maxsize` the cap counts distinct subjects.
+
+        Dropped and replaced messages count in `sub.dropped`. Use a broker
+        (NATS, Redis) when you need real backpressure.
         """
         if not patterns:
             raise StarioError(
                 "subscribe() requires at least one pattern",
                 example='relay.subscribe("room.*")',
             )
+        if maxsize is not None and maxsize < 1:
+            raise StarioError(
+                "subscribe(maxsize=) must be at least 1",
+                context={"maxsize": maxsize},
+            )
 
         return RelaySubscription(
             self,
             _deduplicate_patterns(tuple(patterns)),
+            maxsize=maxsize,
+            latest=latest,
         )

@@ -1,14 +1,13 @@
 """
 Room feature handlers — one room URL, SSE stream, and POST commands.
 
-Queries: show_room, subscribe
+Queries: show_room, live
 Commands: send_message, typing
 """
 
 import time
 import uuid
 
-import stario.responses as responses
 from app.common.identity import identity_for_page
 from app.db import Database
 from app.features.lobby.urls import LOBBY
@@ -18,14 +17,14 @@ from stario.datastar import SSE
 from . import data, subjects
 from .models import Message, Room, User
 from .signals import read_chat_signals
-from .urls import ROOM, SEND, SUBSCRIBE, TYPING
+from .urls import LIVE, ROOM, SEND, TYPING
 from .views import ROOM_LIVE_SELECTOR, room_live_view, room_view
 
 MAX_MESSAGE_LENGTH = 2000
 
 
 def room_from_route(c: Context, db: Database) -> Room | None:
-    room_id = c.route.params.get("room_id", "")
+    room_id = c.match.params.get("room_id", "")
     return data.get_room(db, room_id) if room_id else None
 
 
@@ -56,7 +55,7 @@ def show_room(db: Database):
     async def handler(c: Context, w: Writer) -> None:
         room = room_from_route(c, db)
         if room is None:
-            responses.redirect(w, LOBBY.href())
+            w.redirect(LOBBY.href())
             return
 
         identity = identity_for_page(c)
@@ -68,8 +67,7 @@ def show_room(db: Database):
             }
         )
 
-        responses.html(
-            w,
+        w.html(
             room_view(
                 room,
                 identity.user_id,
@@ -83,8 +81,8 @@ def show_room(db: Database):
     return handler
 
 
-def subscribe(db: Database, relay: Relay[str]):
-    """GET /rooms/{room_id}/subscribe — SSE patches for this room.
+def live(db: Database, relay: Relay[str]):
+    """GET /rooms/{room_id}/live — SSE patches for this room.
 
     `c.alive` ends the loop on client disconnect or server shutdown, so the
     presence cleanup below always runs. If the room is deleted mid-stream we
@@ -94,12 +92,13 @@ def subscribe(db: Database, relay: Relay[str]):
     async def handler(c: Context, w: Writer) -> None:
         room = room_from_route(c, db)
         if room is None:
-            responses.redirect(w, LOBBY.href())
+            SSE(w).navigate(LOBBY.href())
             return
 
         signals = await read_chat_signals(c)
         if not signals.user_id:
-            responses.redirect(w, ROOM.href(room_id=room.id))
+            # Reload the room page, which mints a fresh identity.
+            SSE(w).navigate(ROOM.href(room_id=room.id))
             return
 
         user = User(
@@ -111,7 +110,7 @@ def subscribe(db: Database, relay: Relay[str]):
 
         # Subscribe first so this connection's queue exists before we publish
         # presence (avoids a gap where join could be dropped for this client).
-        async with relay.subscribe(subjects.room_events(room.id)) as live:
+        async with relay.subscribe(subjects.room_events(room.id)) as events:
             sse = SSE(w)
             data.add_user(db, user)
             relay.publish(subjects.presence(room.id), "join")
@@ -133,7 +132,7 @@ def subscribe(db: Database, relay: Relay[str]):
                 db=db,
             )
 
-            async for subject, _ in c.alive(live):
+            async for subject, _ in c.alive(events):
                 c.span.event("relay", {"subject": subject})
                 if data.get_room(db, room.id) is None:
                     sse.navigate(LOBBY.href())
@@ -164,20 +163,20 @@ def send_message(db: Database, relay: Relay[str]):
     async def handler(c: Context, w: Writer) -> None:
         room = room_from_route(c, db)
         if room is None:
-            responses.redirect(w, LOBBY.href(), 303)
+            SSE(w).navigate(LOBBY.href())
             return
 
         signals = await read_chat_signals(c)
         if not signals.user_id or not data.user_exists(db, signals.user_id, room.id):
-            responses.redirect(w, ROOM.href(room_id=room.id), 303)
+            SSE(w).navigate(ROOM.href(room_id=room.id))
             return
 
         text = signals.message.strip()[:MAX_MESSAGE_LENGTH]
         if not text:
-            responses.empty(w)
+            w.empty()
             return
 
-        responses.empty(w)
+        w.empty()
 
         c.span.attrs({"user_id": signals.user_id, "room_id": room.id})
 
@@ -208,15 +207,15 @@ def typing(db: Database, relay: Relay[str]):
     async def handler(c: Context, w: Writer) -> None:
         room = room_from_route(c, db)
         if room is None:
-            responses.empty(w)
+            w.empty()
             return
 
         signals = await read_chat_signals(c)
         if not signals.user_id or not data.user_exists(db, signals.user_id, room.id):
-            responses.empty(w)
+            w.empty()
             return
 
-        responses.empty(w)
+        w.empty()
 
         is_typing = bool(signals.message.strip())
         if data.set_user_typing(db, signals.user_id, room.id, is_typing):
@@ -227,6 +226,6 @@ def typing(db: Database, relay: Relay[str]):
 
 def register_room(app: App, db: Database, relay: Relay[str]) -> None:
     app.add(ROOM, show_room(db))
-    app.add(SUBSCRIBE, subscribe(db, relay))
+    app.add(LIVE, live(db, relay))
     app.add(SEND, send_message(db, relay))
     app.add(TYPING, typing(db, relay))

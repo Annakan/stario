@@ -4,8 +4,7 @@ Stario Tiles — your first realtime hypermedia app (single file).
 Collaborative painting board: HTTP for the page and commands, SSE for live
 updates, in-process Relay to fan out between open tabs.
 
-Run with: uv run stario watch main:bootstrap
-      or: uv run stario serve main:bootstrap
+Run with: uv run python -m main
 
 Read top to bottom:
 
@@ -18,7 +17,7 @@ Read top to bottom:
 Three routes, three jobs (CQRS-shaped, not a framework):
 
   GET  /           first paint — build HTML once
-  GET  /subscribe  stay open — patch HTML whenever Relay fires
+  GET  /live  stay open — patch HTML whenever Relay fires
   POST /click      change board — 204 immediately, updates arrive on SSE
 
 Handlers use c.span for request telemetry; bootstrap uses span.attrs at startup.
@@ -27,24 +26,23 @@ For a multi-file layout, clone examples/chat-room from the stario repo
 """
 
 import random
+import threading
 import uuid
 from pathlib import Path
 
-import stario.responses as responses
 from stario import (
     App,
-    AssetManifest,
+    Assets,
     Context,
     Relay,
     Route,
     Span,
-    StaticAssets,
     Writer,
+    h,
 )
 from stario.datastar import SSE, at, data, read_signals
 from stario.debug import debug_inspector
 from stario.markup import HtmlElement, baked, classes, styles
-from stario.markup import html as h
 
 # Stario apps center on: Context (per-request), Writer (transport), and plain Python
 # instead of a template language. HTML tags live under `stario.markup.html`;
@@ -61,17 +59,16 @@ from stario.markup import html as h
 # =============================================================================
 
 
-# Cheap at import time: scan + fingerprint only. Serving (compression, caching)
-# is paid in bootstrap when StaticAssets wraps the manifest.
-ASSETS = AssetManifest(Path(__file__).parent / "static")
+# href() is cheap. attach(app) in bootstrap registers routes and loads files.
+ASSETS = Assets(Path(__file__).parent / "static", "/static")
 # Fingerprinted once at import — links stay stable across deploys that hash files.
 STYLE_CSS = ASSETS.href("css/style.css")
 DATASTAR_JS = ASSETS.href("js/datastar.js")
 
-# One Route per endpoint — register with app.add, link with href() or at.fetch.
-HOME = Route.get("/")
-SUBSCRIBE = Route.get("/subscribe")
-CLICK = Route.post("/click")
+# One Route per endpoint — register with app.add, link with href() or at.get / at.post.
+HOME = Route("GET", "/")
+LIVE = Route("GET", "/live")
+CLICK = Route("POST", "/click")
 
 # =============================================================================
 # 2. State
@@ -82,7 +79,7 @@ CLICK = Route.post("/click")
 # Views are pure functions that build HTML using the callables in
 # `stario.markup.html` (each tag is a function-like object: Div, Span, …). You nest
 # them like a normal function call tree; the framework turns that tree into
-# markup when you pass it to `responses.html()` or
+# markup when you pass it to `w.html()` or
 # `SSE(w).patch_elements()`, with escaping applied
 # to ordinary strings so user-controlled text is safe by default.
 # This file imports `stario.markup.html` as `h` so tag constructors read as `h.Div`,
@@ -114,7 +111,8 @@ class Game:
         self.grid_size = grid_size
         self.colors = palette
         self.board: dict[int, str] = {}  # cell index → paint color
-        self.user_colors: dict[str, str] = {}  # only tabs with an open /subscribe
+        self.user_colors: dict[str, str] = {}  # only tabs with an open /live
+        self._lock = threading.Lock()
 
         total = grid_size * grid_size
         # Partial fill so first paint looks lived-in, not an empty grid.
@@ -127,22 +125,33 @@ class Game:
 
     def join(self, user_id: str) -> None:
         # Stable color per id — reconnecting the same tab keeps the same swatch.
-        if user_id not in self.user_colors:
-            self.user_colors[user_id] = random.Random(user_id).choice(self.colors)
+        with self._lock:
+            if user_id not in self.user_colors:
+                self.user_colors[user_id] = random.Random(user_id).choice(self.colors)
 
     def leave(self, user_id: str) -> None:
         # SSE closed — drop from roster so other tabs stop counting this player.
-        self.user_colors.pop(user_id, None)
+        with self._lock:
+            self.user_colors.pop(user_id, None)
 
     def paint_cell(self, user_id: str, cell_id: int) -> str:
         """Toggle cell with this player's color. Returns painted or cleared."""
-        color = self.user_colors[user_id]
-        # Same color again erases — quick undo without a separate erase action.
-        if self.board.get(cell_id) == color:
-            self.board.pop(cell_id, None)
-            return "cleared"
-        self.board[cell_id] = color
-        return "painted"
+        with self._lock:
+            color = self.user_colors[user_id]
+            # Same color again erases — quick undo without a separate erase action.
+            if self.board.get(cell_id) == color:
+                self.board.pop(cell_id, None)
+                return "cleared"
+            self.board[cell_id] = color
+            return "painted"
+
+    def snapshot_board(self) -> dict[int, str]:
+        with self._lock:
+            return dict(self.board)
+
+    def snapshot_users(self) -> dict[str, str]:
+        with self._lock:
+            return dict(self.user_colors)
 
 
 # =============================================================================
@@ -186,7 +195,8 @@ def cell_view(cell_id: int, color: str | None) -> HtmlElement:
 
 def board_view(game: Game) -> HtmlElement:
     size = game.grid_size
-    complete = len(game.board) == game.total_cells
+    board = game.snapshot_board()
+    complete = len(board) == game.total_cells
 
     return h.Div(
         {"id": "board"},
@@ -203,7 +213,7 @@ def board_view(game: Game) -> HtmlElement:
             h.Div(
                 {"class": "row"},
                 [
-                    cell_view(row * size + col, game.board.get(row * size + col))
+                    cell_view(row * size + col, board.get(row * size + col))
                     for col in range(size)
                 ],
             )
@@ -213,8 +223,10 @@ def board_view(game: Game) -> HtmlElement:
 
 
 def info_view(user_id: str, game: Game) -> HtmlElement:
-    # Before /subscribe runs, this tab isn't in user_colors yet — show a neutral swatch.
-    my_color = game.user_colors.get(user_id, "#ccc")
+    # Before /live runs, this tab isn't in user_colors yet — show a neutral swatch.
+    users = game.snapshot_users()
+    my_color = users.get(user_id, "#ccc")
+    colors = list(users.values())
     return h.Div(
         {"id": "info", "class": "info-panel"},
         h.Div(
@@ -229,7 +241,7 @@ def info_view(user_id: str, game: Game) -> HtmlElement:
                             styles({"background-color": color}),
                         )
                     )
-                    for color in game.user_colors.values()
+                    for color in colors
                 ]
                 or [h.Li({"class": "empty"}, "...")],
             ),
@@ -250,8 +262,8 @@ def home_view(user_id: str, game: Game) -> HtmlElement:
             # Signals: client-held JSON synced with the server; every Datastar @get/@post includes them.
             # if_missing=True: set defaults only when absent so reconnects don't clobber client state.
             data.signals({"user_id": user_id}, if_missing=True),
-            # Mount opens GET /subscribe; retry="always" survives brief network blips.
-            data.init(at.fetch(SUBSCRIBE, retry="always")),
+            # Mount opens GET /live; retry="always" survives brief network blips.
+            data.init(at.get(LIVE.href(), retry="always")),
             # data.init runs once when the node mounts — here it opens the SSE stream (`@get`).
             h.H1("Tiles - Stario App"),
             h.P(
@@ -273,7 +285,7 @@ def home_view(user_id: str, game: Game) -> HtmlElement:
 # Each route is a factory — home(game) returns the real handler so bootstrap can
 # inject shared state without globals. hello-world skips this; tiles needs it.
 #
-# Queries (read):  home, subscribe
+# Queries (read):  home, live
 # Commands (write): click
 
 
@@ -291,29 +303,29 @@ def home(game: Game):
         # Fresh id per tab — becomes a Datastar signal for later POSTs and SSE.
         user_id = str(uuid.uuid4())[:8]
         c.span.attr("user_id", user_id)
-        responses.html(w, home_view(user_id, game))
+        w.html(home_view(user_id, game))
 
     return handler
 
 
-def subscribe(game: Game, relay: Relay[str]):
-    """GET /subscribe — SSE stream; re-render home_view on every relay event."""
+def live(game: Game, relay: Relay[str]):
+    """GET /live — SSE stream; re-render home_view on every relay event."""
 
     async def handler(c: Context, w: Writer) -> None:
         user_id = await read_user_id(c)
         if not user_id:
             c.span.event("Missing user id", {})
-            responses.redirect(w, HOME.href())
+            w.redirect(HOME.href())
             return
 
         # Queue must exist before publish — otherwise this tab misses its own join.
         # Subscribe first so this connection's queue exists before we publish presence
         # (avoids a gap where "join" and other events could be dropped for this client).
-        async with relay.subscribe("*") as live:
+        async with relay.subscribe("*") as events:
             sse = SSE(w)
             game.join(user_id)
             # Same fan-out as clicks: all SSE clients patch so everyone sees the new player.
-            relay.publish("join", user_id)  # wakes every open subscribe loop
+            relay.publish("join", user_id)  # wakes every open live loop
             c.span.event("Player connected", {"user_id": user_id})
             c.span.attr("user_id", user_id)
 
@@ -324,7 +336,7 @@ def subscribe(game: Game, relay: Relay[str]):
             # First iteration (and every later one): relay fan-out — join included — drives patches.
             # No separate onload patch: `publish("join")` already queues for this subscriber.
             # `*` matches all topics; fine for demos — production often namespaces keys.
-            async for subject, _ in c.alive(live):
+            async for subject, _ in c.alive(events):
                 c.span.event("relay", {"subject": subject})
                 sse.patch_elements(home_view(user_id, game))
 
@@ -341,23 +353,23 @@ def click(game: Game, relay: Relay[str]):
 
     async def handler(c: Context, w: Writer) -> None:
         user_id = await read_user_id(c)
-        # Membership in user_colors means /subscribe succeeded for this tab.
+        # Membership in user_colors means /live succeeded for this tab.
         if user_id not in game.user_colors:
-            responses.redirect(w, HOME.href())
+            w.redirect(HOME.href())
             return
 
         cell_id_param = c.req.query.get("cellId")
         if cell_id_param is None:
-            responses.redirect(w, HOME.href())
+            w.redirect(HOME.href())
             return
 
         try:
             cell_id = int(cell_id_param)
         except ValueError:
-            responses.redirect(w, HOME.href())
+            w.redirect(HOME.href())
             return
         if not 0 <= cell_id < game.total_cells:
-            responses.redirect(w, HOME.href())
+            w.redirect(HOME.href())
             return
 
         c.span.attrs({"user_id": user_id, "cell_id": cell_id})
@@ -366,13 +378,13 @@ def click(game: Game, relay: Relay[str]):
         # a response first in Starlette/FastAPI and then running a background task:
         # the client is done waiting, but this coroutine continues and may do I/O or
         # broadcast (here: update shared state and notify other tabs).
-        responses.empty(w, 204)  # ack before fan-out — browser isn't waiting for HTML
+        w.empty(204)  # ack before fan-out — browser isn't waiting for HTML
 
         action = game.paint_cell(user_id, cell_id)
         c.span.event("Cell toggled", {"cell_id": cell_id, "action": action})
 
         # Fan-out: every open SSE subscription receives this; each client's
-        # `subscribe` loop wakes up and calls `sse.patch_elements()`, so all users re-render.
+        # `live` loop wakes up and calls `sse.patch_elements()`, so all users re-render.
         # Real-time in this demo—and the same pub/sub + patch pattern scales to
         # larger apps with a broker instead of in-process `Relay`.
         relay.publish("click", user_id)  # SSE tabs re-read Game and patch
@@ -391,7 +403,7 @@ def click(game: Game, relay: Relay[str]):
 async def bootstrap(app: App, span: Span):
     # `span` is the root bootstrap tracer; attr() annotates startup for TTY/JSON/SQLite sinks.
     game = Game()
-    relay = Relay[str]()  # process-local fan-out between open /subscribe loops
+    relay = Relay[str]()  # process-local fan-out between open /live loops
 
     span.attrs(
         {
@@ -404,13 +416,19 @@ async def bootstrap(app: App, span: Span):
 
     # Compression + caching cost is paid here; stats land on the startup trace.
     with span.step("static_assets") as s:
-        static = StaticAssets(ASSETS)
-        s.attrs(static.stats)
-    static.register(app)
+        s.attrs(await ASSETS.attach(app))
 
     # Queries — return or stream HTML
     app.add(HOME, home(game))
-    app.add(SUBSCRIBE, subscribe(game, relay))
+    app.add(LIVE, live(game, relay))
     # Commands — mutate Game, nudge relay; updates arrive on SSE
     app.add(CLICK, click(game, relay))
     yield
+
+
+if __name__ == "__main__":
+    import asyncio
+
+    from stario import serve
+
+    asyncio.run(serve(bootstrap))
